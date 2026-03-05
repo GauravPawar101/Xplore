@@ -1,0 +1,542 @@
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600&family=Inter:wght@400;500;600;700&display=swap');
+
+:root {
+    --c0: #06090f;
+    --c1: #0b1017;
+    --c2: #111720;
+    --c3: #171f2e;
+    --c4: #1d2840;
+    --ln: rgba(255, 255, 255, 0.055);
+    --ln2: rgba(255, 255, 255, 0.10);
+    --bl: #3b82f6;
+    --bld: rgba(59, 130, 246, 0.14);
+    --blg: rgba(59, 130, 246, 0.26);
+    --tl: #14b8a6;
+    --am: #f59e0b;
+    --rs: #f43f5e;
+    --gr: #22c55e;
+    --t1: #dde4f0;
+    --t2: #8899b0;
+    --t3: #3d5066;
+    --t4: #243040;
+    --mono: 'JetBrains Mono', monospace;
+    --ui: 'Inter', sans-serif;
+    --nw: 234px;
+    --nh: 64px;
+}
+
+*,
+*::before,
+*::after {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0
+}
+
+html,
+body,
+#root {
+    height: 100%;
+    overflow: hidden
+}
+
+body {
+    background: var(--c0);
+    color: var(--t1);
+    font-family: var(--mono);
+    -webkit-font-smoothing: antialiased
+}
+
+/* scrollbar */
+.ez-s::-webkit-scrollbar {
+    width: 3px
+}
+
+.ez-s::-webkit-scrollbar-track {
+    background: transparent
+}
+
+.ez-s::-webkit-scrollbar-thumb {
+    background: var(--c4);
+    border-radius: 99px
+}
+
+/* ReactFlow resets and canvas */
+.react-flow__background {
+    background: var(--c0) !important;
+    background-image: radial-gradient(ellipse 120% 80% at 50% 40%, rgba(30, 41, 59, 0.25), transparent 50%) !important;
+}
+
+.react-flow__viewport {
+    transition: transform 0.15s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.react-flow__renderer {
+    contain: layout style paint;
+}
+
+.react-flow__controls {
+    background: var(--c2) !important;
+    border: 1px solid var(--ln2) !important;
+    border-radius: 8px !important;
+    overflow: hidden;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, .6) !important
+}
+
+.react-flow__controls-button {
+    background: transparent !important;
+    border-bottom: 1px solid var(--ln) !important;
+    border-right: none !important;
+    fill: var(--t3) !important;
+    width: 28px !important;
+    height: 28px !important;
+    transition: all .12s !important
+}
+
+.react-flow__controls-button:hover {
+    background: var(--bld) !important;
+    fill: var(--bl) !important
+}
+
+/* disable selection box — it causes a repaint on every mousemove */
+.react-flow__selection {
+    display: none !important
+}
+
+/* edges: pointer-events off so they don't intercept drag */
+.react-flow__edge {
+    pointer-events: none !important;
+}
+
+.react-flow__edge.active {
+    pointer-events: none !important;
+}
+
+.react-flow__edge .ez-edge-g {
+    contain: layout paint;
+}
+
+/* Expand animation: bright pulse traveling along new edges */
+@keyframes ez-edge-pulse-draw {
+    from { stroke-dashoffset: 1; }
+    to   { stroke-dashoffset: 0; }
+}
+
+.ez-edge-pulse {
+    vector-effect: non-scaling-stroke;
+}
+
+/* Expand animation: node glow when just revealed */
+.ez-node-expand-pulse {
+    animation: ez-node-expand-glow 1.8s ease-out forwards;
+}
+
+@keyframes ez-node-expand-glow {
+    0%   { box-shadow: 0 0 0 0 rgba(167, 139, 250, 0.8), 0 0 24px rgba(139, 92, 246, 0.5); }
+    40%  { box-shadow: 0 0 0 6px rgba(167, 139, 250, 0.4), 0 0 32px rgba(139, 92, 246, 0.6); }
+    100% { box-shadow: 0 0 0 0 rgba(167, 139, 250, 0), 0 0 0 0 rgba(139, 92, 246, 0); }
+}
+
+.ez-fg-expand-pulse {
+    animation: ez-node-expand-glow 1.8s ease-out forwards;
+}
+
+/* node card container — glass, subtle glow */
+.ez-node {
+    width: var(--nw);
+    height: var(--nh);
+    background: linear-gradient(152deg, rgba(22, 30, 44, 0.92), rgba(14, 20, 30, 0.96));
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: 14px;
+    padding: 10px 12px 10px 15px;
+    cursor: pointer;
+    position: relative;
+    overflow: hidden;
+    transition: transform 0.2s cubic-bezier(0.4, 0, 0.2, 1), box-shadow 0.2s ease, border-color 0.2s ease;
+    will-change: transform;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.35), 0 1px 0 rgba(255, 255, 255, 0.03) inset;
+    contain: layout style;
+}
+
+.ez-node:hover {
+    border-color: rgba(255, 255, 255, 0.14);
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5), 0 0 20px rgba(59, 130, 246, 0.08);
+    transform: translateY(-2px);
+}
+
+.ez-node.ez-entry {
+    border-color: rgba(20, 184, 166, 0.45);
+    background: linear-gradient(152deg, rgba(14, 32, 30, 0.9), rgba(10, 26, 24, 0.96));
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(20, 184, 166, 0.15);
+}
+
+.ez-node.ez-focused {
+    border-color: var(--bl) !important;
+    background: linear-gradient(152deg, rgba(18, 32, 55, 0.95), rgba(14, 26, 45, 0.98));
+    box-shadow: 0 0 0 1.5px var(--bl), 0 12px 40px rgba(59, 130, 246, 0.25), 0 0 24px rgba(59, 130, 246, 0.12);
+    transform: scale(1.02);
+}
+
+.ez-node.ez-called {
+    border-color: rgba(20, 184, 166, 0.5) !important;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.35), 0 0 0 1px rgba(20, 184, 166, 0.2);
+}
+
+.ez-node.ez-caller {
+    border-color: rgba(245, 158, 11, 0.5) !important;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.35), 0 0 0 1px rgba(245, 158, 11, 0.2);
+}
+
+.ez-node.ez-dim {
+    opacity: 0.2;
+    pointer-events: none;
+    filter: grayscale(0.6) brightness(0.7);
+    transform: scale(0.98);
+}
+
+/* accent bar left */
+.ez-node::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 4px;
+    border-radius: 14px 0 0 14px;
+    background: rgba(255, 255, 255, 0.08);
+    transition: background 0.2s, box-shadow 0.2s;
+}
+
+.ez-node.ez-entry::before {
+    background: linear-gradient(180deg, var(--tl), rgba(20, 184, 166, 0.6));
+    box-shadow: 0 0 12px rgba(20, 184, 166, 0.4);
+}
+
+.ez-node.ez-focused::before {
+    background: linear-gradient(180deg, var(--bl), rgba(59, 130, 246, 0.6));
+    box-shadow: 0 0 14px rgba(59, 130, 246, 0.5);
+}
+
+.ez-node.ez-called::before {
+    background: var(--tl);
+    opacity: 0.9;
+}
+
+.ez-node.ez-caller::before {
+    background: var(--am);
+    opacity: 0.9;
+}
+
+/* sidebar */
+.ez-sidebar {
+    width: 268px;
+    flex-shrink: 0;
+    border-right: 1px solid var(--ln);
+    background: var(--c1);
+    display: flex;
+    flex-direction: column
+}
+
+.ez-tab {
+    flex: 1;
+    padding: 4px 3px;
+    border-radius: 5px;
+    border: none;
+    cursor: pointer;
+    font-size: 9px;
+    font-weight: 600;
+    letter-spacing: .07em;
+    text-transform: uppercase;
+    transition: all .12s;
+    font-family: var(--mono)
+}
+
+.ez-tab.on {
+    background: var(--bld);
+    color: #93c5fd
+}
+
+.ez-tab.off {
+    background: transparent;
+    color: var(--t3)
+}
+
+.ez-inp {
+    width: 100%;
+    padding: 7px 10px 7px 27px;
+    background: rgba(0, 0, 0, .55);
+    border: 1px solid var(--ln2);
+    border-radius: 6px;
+    color: var(--t1);
+    font-size: 11px;
+    outline: none;
+    font-family: var(--mono);
+    transition: border-color .12s
+}
+
+.ez-inp:focus {
+    border-color: var(--bl)
+}
+
+.ez-run {
+    width: 100%;
+    padding: 9px;
+    border-radius: 6px;
+    border: none;
+    background: var(--bl);
+    color: #fff;
+    font-size: 11px;
+    font-weight: 700;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    font-family: var(--ui);
+    transition: filter .12s, opacity .12s
+}
+
+.ez-run:hover:not(:disabled) {
+    filter: brightness(1.15)
+}
+
+.ez-run:disabled {
+    opacity: .5;
+    cursor: not-allowed
+}
+
+@keyframes ez-spin {
+    to {
+        transform: rotate(360deg)
+    }
+}
+
+.ez-spin {
+    animation: ez-spin 1s linear infinite
+}
+
+@keyframes ez-flow {
+    from {
+        stroke-dashoffset: 20
+    }
+
+    to {
+        stroke-dashoffset: 0
+    }
+}
+
+.ez-flow {
+    animation: ez-flow .7s linear infinite
+}
+
+/* ── Architecture view: file group cards ── */
+.ez-fg {
+    position: relative;
+    background: linear-gradient(162deg, rgba(22, 30, 44, 0.9), rgba(14, 20, 30, 0.96));
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: 14px;
+    overflow: hidden;
+    cursor: pointer;
+    transition: transform 0.2s cubic-bezier(0.4, 0, 0.2, 1), box-shadow 0.2s ease, border-color 0.2s ease;
+    will-change: transform;
+    box-shadow: 0 6px 28px rgba(0, 0, 0, 0.4), 0 1px 0 rgba(255, 255, 255, 0.03) inset;
+    contain: layout style;
+}
+
+.ez-fg:hover {
+    border-color: rgba(255, 255, 255, 0.12);
+    box-shadow: 0 14px 44px rgba(0, 0, 0, 0.55), 0 0 24px rgba(59, 130, 246, 0.1);
+    transform: translateY(-2px);
+}
+
+.ez-fg.ez-fg-entry {
+    border-color: rgba(20, 184, 166, 0.4);
+    box-shadow: 0 6px 28px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(20, 184, 166, 0.12);
+}
+
+.ez-fg.ez-fg-focus {
+    border-color: var(--bl) !important;
+    box-shadow: 0 0 0 1.5px var(--bl), 0 14px 44px rgba(59, 130, 246, 0.2), 0 0 28px rgba(59, 130, 246, 0.1);
+}
+
+.ez-fg.ez-fg-dim {
+    opacity: 0.2;
+    pointer-events: none;
+    filter: grayscale(0.6) brightness(0.7);
+    transform: scale(0.98);
+}
+
+.ez-fg::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 4px;
+    border-radius: 14px 0 0 14px;
+    background: rgba(255, 255, 255, 0.08);
+    transition: background 0.2s, box-shadow 0.2s;
+    z-index: 2;
+}
+
+.ez-fg.ez-fg-entry::before {
+    background: linear-gradient(180deg, var(--tl), rgba(20, 184, 166, 0.5));
+    box-shadow: 0 0 10px rgba(20, 184, 166, 0.35);
+}
+
+.ez-fg.ez-fg-focus::before {
+    background: linear-gradient(180deg, var(--bl), rgba(59, 130, 246, 0.5));
+    box-shadow: 0 0 12px rgba(59, 130, 246, 0.45);
+}
+
+.ez-fg-hdr {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 10px 14px 9px;
+    background: rgba(255, 255, 255, 0.02);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+    flex-shrink: 0;
+}
+
+.ez-fg-name {
+    font-size: 13px;
+    font-weight: 600;
+    color: #f1f5f9;
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.ez-fg-lang {
+    font-size: 7.5px;
+    padding: 2px 7px;
+    border-radius: 99px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    border: 1px solid;
+    flex-shrink: 0;
+}
+
+.ez-fg-members {
+    padding: 8px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    overflow: hidden;
+    background: transparent;
+}
+
+.ez-fmember {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 8px;
+    border-radius: 6px;
+    transition: all 0.15s;
+    cursor: pointer;
+    background: rgba(255, 255, 255, 0.015);
+    border: 1px solid transparent;
+}
+
+.ez-fmember:hover {
+    background: rgba(59, 130, 246, 0.15);
+    border-color: rgba(59, 130, 246, 0.3);
+    transform: translateX(2px);
+}
+
+.ez-fmname {
+    font-size: 10.5px;
+    color: #cbd5e1;
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-weight: 500;
+}
+
+.ez-fmtype {
+    font-size: 7px;
+    color: #64748b;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    flex-shrink: 0;
+}
+
+/* ── View toggle ── */
+.ez-vtog {
+    display: flex;
+    gap: 2px;
+    background: rgba(0, 0, 0, .6);
+    border-radius: 6px;
+    padding: 2px;
+    border: 1px solid var(--ln)
+}
+
+.ez-vtog-btn {
+    padding: 4px 11px;
+    border-radius: 4px;
+    border: none;
+    cursor: pointer;
+    font-size: 9px;
+    font-weight: 600;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    font-family: var(--mono);
+    transition: all .12s
+}
+
+.ez-vtog-btn.on {
+    background: var(--bl);
+    color: #fff;
+    box-shadow: 0 0 10px rgba(59, 130, 246, 0.4)
+}
+
+.ez-vtog-btn.off {
+    background: transparent;
+    color: var(--t3)
+}
+
+.ez-zoom-slider {
+    -webkit-appearance: none;
+    width: 80px;
+    height: 3px;
+    background: var(--ln2);
+    border-radius: 99px;
+    outline: none;
+}
+
+.ez-zoom-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: var(--bl);
+    cursor: pointer;
+    box-shadow: 0 0 5px rgba(59, 130, 246, 0.5)
+}
+
+.ez-zoom-slider::-moz-range-thumb {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: var(--bl);
+    cursor: pointer;
+    border: none;
+    box-shadow: 0 0 5px rgba(59, 130, 246, 0.5)
+}
+
+/* ── File Clusters ── */
+.ez-cluster-bg {
+    position: absolute;
+    border: 1px dashed rgba(255, 255, 255, 0.1);
+    border-radius: 12px;
+    pointer-events: none;
+    z-index: -1;
+}

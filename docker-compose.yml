@@ -1,0 +1,153 @@
+# EzDocs — full stack (infra + microservices)
+# Run: docker compose up -d --build
+# Stop + clean: docker compose down -v
+
+services:
+
+  # ─── Infrastructure ────────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:16.4-alpine
+    container_name: ezdocs-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ezdocs
+    ports:
+      - "7998:5432"
+    volumes:
+      - ezdocs_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres -d ezdocs" ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  mongo:
+    image: mongo:7
+    container_name: ezdocs-mongo
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - ezdocs_mongo:/data/db
+    healthcheck:
+      test: [ "CMD", "mongosh", "--eval", "db.adminCommand('ping')" ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  milvus:
+    image: milvusdb/milvus:v2.4.0
+    container_name: ezdocs-milvus
+    restart: unless-stopped
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    volumes:
+      - ezdocs_milvus:/var/lib/milvus
+
+  # ─── Microservices ─────────────────────────────────────────────────────────
+
+  graph:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: ezdocs-backend
+    container_name: ezdocs-graph
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    env_file: ./backend/.env
+    environment:
+      EZDOCS_HOST: "0.0.0.0"
+      EZDOCS_PORT: "8001"
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/ezdocs
+      MONGODB_URI: mongodb://mongo:27017
+      MILVUS_URI: http://milvus:19530
+    command: uvicorn graph.app:app --host 0.0.0.0 --port 8001
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  rag:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: ezdocs-backend
+    container_name: ezdocs-rag
+    restart: unless-stopped
+    ports:
+      - "8003:8003"
+    env_file: ./backend/.env
+    environment:
+      EZDOCS_HOST: "0.0.0.0"
+      EZDOCS_PORT: "8003"
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/ezdocs
+      MONGODB_URI: mongodb://mongo:27017
+      MILVUS_URI: http://milvus:19530
+    command: uvicorn rag.app:app --host 0.0.0.0 --port 8003
+    depends_on:
+      postgres:
+        condition: service_healthy
+      milvus:
+        condition: service_started
+
+  program:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: ezdocs-backend
+    container_name: ezdocs-program
+    restart: unless-stopped
+    ports:
+      - "8004:8004"
+    env_file: ./backend/.env
+    environment:
+      EZDOCS_HOST: "0.0.0.0"
+      EZDOCS_PORT: "8004"
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/ezdocs
+      MONGODB_URI: mongodb://mongo:27017
+      MILVUS_URI: http://milvus:19530
+    command: uvicorn program.app:app --host 0.0.0.0 --port 8004
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+
+  gateway:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: ezdocs-backend
+    container_name: ezdocs-gateway
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file: ./backend/.env
+    environment:
+      EZDOCS_HOST: "0.0.0.0"
+      EZDOCS_PORT: "8000"
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/ezdocs
+      MONGODB_URI: mongodb://mongo:27017
+      MILVUS_URI: http://milvus:19530
+      EZDOCS_GRAPH_SVC_URL: http://graph:8001
+      EZDOCS_RAG_SVC_URL: http://rag:8003
+      EZDOCS_PROGRAM_SVC_URL: http://program:8004
+    command: python gateway.py
+    depends_on:
+      graph:
+        condition: service_started
+      rag:
+        condition: service_started
+      program:
+        condition: service_started
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  ezdocs_pgdata:
+  ezdocs_mongo:
+  ezdocs_milvus:

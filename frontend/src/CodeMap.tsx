@@ -1,0 +1,1115 @@
+import React, {
+  useState,
+  useCallback,
+  useRef,
+  useEffect,
+  useMemo,
+} from 'react';
+import ReactFlow, {
+  ReactFlowProvider,
+  useNodesState,
+  useEdgesState,
+  useReactFlow,
+  useViewport,
+  Background,
+  Panel,
+  Node,
+  Edge,
+} from 'reactflow';
+import 'reactflow/dist/base.css';
+import {
+  Play,
+  Terminal,
+  Activity,
+  X,
+  Cpu,
+  GitBranch,
+  Folder,
+  Search,
+  AlertCircle,
+  Volume2,
+  VolumeX,
+  Plus,
+  Microscope,
+} from 'lucide-react';
+import axios from 'axios';
+import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
+import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
+import { motion, AnimatePresence } from 'framer-motion';
+import ReactMarkdown from 'react-markdown';
+
+import './CodeMap.css';
+import { ENTRY_KW, API_BASE, WS_BASE } from '@/config/constants';
+import { treeLayout, applyEdgeFocus } from '@/lib/layoutUtils';
+import { EzNode } from '@/components/EzNode';
+import { EzEdge } from '@/components/EzEdge';
+import { FileGroupNode } from '@/components/FileGroupNode';
+import { FileItem } from '@/components/FileItem';
+import { FocusCtx, MemberClickCtx } from '@/components/context';
+import { useTour } from '@/context/TourContext';
+
+const NODE_TYPES: Record<string, React.ComponentType<any>> = {
+  ez: EzNode,
+  fileGroup: FileGroupNode,
+};
+const EDGE_TYPES: Record<string, React.ComponentType<any>> = { ez: EzEdge };
+
+function EzDocsInner() {
+  const [nodes, setNodes, onNodesChange] = useNodesState([]);
+  const [edges, setEdges, onEdgesChange] = useEdgesState([]);
+  const [clusters, setClusters] = useState<any[]>([]);
+  const { fitView } = useReactFlow();
+  const viewport = useViewport();
+
+  const masterNodes = useRef<Node[]>([]);
+  const masterEdges = useRef<Edge[]>([]);
+
+  const [focusId, setFocusId] = useState<string | null>(null);
+  const [outSet, setOutSet] = useState<Set<string>>(new Set());
+  const [inSet, setInSet] = useState<Set<string>>(new Set());
+  const focusCtxValue = useMemo(
+    () => ({ focusId, outSet, inSet }),
+    [focusId, outSet, inSet]
+  );
+
+  const [selectedNode, setSelectedNode] = useState<Node | null>(null);
+  const [mode, setMode] = useState<'local' | 'github' | 'upload'>('local');
+  const [path, setPath] = useState('../backend');
+  const [codebaseId, setCodebaseId] = useState<string | null>(null);
+  const [savedAnalyses, setSavedAnalyses] = useState<{ codebase_id: string; source_path: string; created_at: string | null }[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [files, setFiles] = useState<any[]>([]);
+  const [stats, setStats] = useState({ n: 0, e: 0 });
+  const [explanation, setExplanation] = useState('');
+  const [aiStreaming, setAiStreaming] = useState(false);
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [visibleNodeIds, setVisibleNodeIds] = useState<Set<string>>(new Set());
+
+  // Codebase Tour narrator
+  const [narration, setNarration] = useState('');
+  const [isNarrating, setIsNarrating] = useState(false);
+  const [showNarrator, setShowNarrator] = useState(false);
+  const [narratorSpeechOn, setNarratorSpeechOn] = useState(true);
+
+  // Per-node narrator
+  const [nodeNarration, setNodeNarration] = useState('');
+  const [isNodeNarrating, setIsNodeNarrating] = useState(false);
+  const [showNodeNarrator, setShowNodeNarrator] = useState(false);
+  const [nodeNarratorSpeechOn, setNodeNarratorSpeechOn] = useState(true);
+
+  // TTS refs — codebase tour
+  const narratorSpeechRef = useRef(true);
+  const sentenceQueue = useRef<string[]>([]);
+  const ttsActive = useRef(false);
+  const ttsChunkBuf = useRef('');
+
+  // TTS refs — per-node
+  const nodeNarratorSpeechRef = useRef(true);
+  const nodeSentenceQueue = useRef<string[]>([]);
+  const nodeTtsActive = useRef(false);
+  const nodeTtsChunkBuf = useRef('');
+
+  // Per-narrator cancelled flags — set true by stopSpeech, drain loops check these
+  const ttsCancelled = useRef(false);
+  const nodeTtsCancelled = useRef(false);
+
+  useEffect(() => { narratorSpeechRef.current = narratorSpeechOn; }, [narratorSpeechOn]);
+  useEffect(() => { nodeNarratorSpeechRef.current = nodeNarratorSpeechOn; }, [nodeNarratorSpeechOn]);
+  useEffect(() => () => window.speechSynthesis?.cancel(), []);
+
+  // ── Stable focus applier (always reads fresh refs, safe in WS closures) ──
+  // Only updates nodes whose focus flags changed to minimize re-renders.
+  const applyFocusRef = useRef<(nodeId: string) => void>(() => { });
+  useEffect(() => {
+    applyFocusRef.current = (nodeId: string) => {
+      const node = masterNodes.current.find(n => n.id === nodeId);
+      if (!node) return;
+
+      const newOut = new Set(
+        masterEdges.current.filter(e => e.source === nodeId).map(e => e.target)
+      );
+      const newIn = new Set(
+        masterEdges.current.filter(e => e.target === nodeId).map(e => e.source)
+      );
+      const hasFocus = true;
+
+      setFocusId(nodeId);
+      setOutSet(newOut);
+      setInSet(newIn);
+
+      setNodes((nodes) =>
+        nodes.map((n) => {
+          const id = n.id;
+          const isFocused = id === nodeId;
+          const isCalled = newOut.has(id);
+          const isCaller = newIn.has(id);
+          const isDim = hasFocus && !isFocused && !isCalled && !isCaller;
+          const d = n.data as Record<string, unknown>;
+          if (d.isFocused === isFocused && d.isCalled === isCalled && d.isCaller === isCaller && d.isDim === isDim)
+            return n;
+          return { ...n, data: { ...d, isFocused, isCalled, isCaller, isDim } };
+        })
+      );
+      setEdges(applyEdgeFocus(masterEdges.current, nodeId));
+      fitView({ nodes: [node], duration: 500, padding: 0.35 });
+    };
+  });
+
+  const clearFocusRef = useRef<() => void>(() => { });
+  useEffect(() => {
+    clearFocusRef.current = () => {
+      setFocusId(null);
+      setOutSet(new Set());
+      setInSet(new Set());
+      setNodes((nodes) =>
+        nodes.map((n) => {
+          const d = n.data as Record<string, unknown>;
+          if (!d.isFocused && !d.isCalled && !d.isCaller && !d.isDim) return n;
+          return { ...n, data: { ...d, isFocused: false, isCalled: false, isCaller: false, isDim: false } };
+        })
+      );
+      setEdges(applyEdgeFocus(masterEdges.current, null));
+      setSelectedNode(null);
+    };
+  });
+
+  // ── TTS helpers ───────────────────────────────────────────────────────
+  // Prefer a natural/neural voice when available; fall back to default.
+  const getPreferredVoice = useCallback(() => {
+    const voices = window.speechSynthesis.getVoices();
+    if (!voices.length) return null;
+    const preferred = voices.find(v =>
+      /natural|neural|premium|google|microsoft|samantha|daniel|karen|moira|alex|siri|enhanced/i.test(v.name)
+    );
+    return preferred ?? voices.find(v => v.default) ?? voices[0];
+  }, []);
+
+  useEffect(() => {
+    if (window.speechSynthesis.getVoices().length > 0) return;
+    const onVoicesChanged = () => { };
+    window.speechSynthesis.onvoiceschanged = onVoicesChanged;
+    return () => { window.speechSynthesis.onvoiceschanged = null; };
+  }, []);
+
+  // Each narrator gets its own drain loop tied to its own `cancelled` ref.
+  // When stopSpeech sets cancelled=true the drain exits immediately on the
+  // next onend/onerror callback — it never touches the sibling narrator.
+  // Softer, more natural settings: slower rate, neutral pitch, preferred voice.
+  const drainQueue = useCallback(
+    (
+      queue: React.MutableRefObject<string[]>,
+      active: React.MutableRefObject<boolean>,
+      cancelled: React.MutableRefObject<boolean>,
+    ) => {
+      const drain = () => {
+        if (cancelled.current) { active.current = false; return; }
+        if (queue.current.length === 0) { active.current = false; return; }
+        active.current = true;
+        const utt = new SpeechSynthesisUtterance(queue.current.shift()!);
+        utt.rate = 0.98;   // Natural pace (was 1.55 — too fast/robotic)
+        utt.pitch = 1;     // Neutral pitch
+        utt.volume = 1;
+        const voice = getPreferredVoice();
+        if (voice) utt.voice = voice;
+        utt.onend = drain;
+        utt.onerror = drain;
+        window.speechSynthesis.speak(utt);
+      };
+      return drain;
+    },
+    [getPreferredVoice]
+  );
+
+  const drainSentenceQueue = useMemo(
+    () => drainQueue(sentenceQueue, ttsActive, ttsCancelled), [drainQueue]
+  );
+  const drainNodeSentenceQueue = useMemo(
+    () => drainQueue(nodeSentenceQueue, nodeTtsActive, nodeTtsCancelled), [drainQueue]
+  );
+
+  const enqueueChunk = useCallback((
+    raw: string,
+    speechRef: React.MutableRefObject<boolean>,
+    buf: React.MutableRefObject<string>,
+    queue: React.MutableRefObject<string[]>,
+    active: React.MutableRefObject<boolean>,
+    drain: () => void,
+  ) => {
+    if (!speechRef.current || !window.speechSynthesis) return;
+    const clean = raw
+      // emojis & pictographic symbols
+      .replace(/[\u{1F000}-\u{1FFFF}]/gu, '')
+      .replace(/[\u{2600}-\u{27BF}]/gu, '')
+      .replace(/[\u{FE00}-\u{FEFF}]/gu, '')
+      // markdown formatting
+      .replace(/#{1,6}\s*/g, '')
+      .replace(/\*\*/g, '')
+      .replace(/\*/g, '')
+      .replace(/_/g, ' ')
+      .replace(/`[^`]*`/g, '')   // inline code spans → drop entirely
+      .replace(/`/g, '')
+      // URLs
+      .replace(/https?:\/\/\S+/g, '')
+      // punctuation clusters TTS stumbles on
+      .replace(/[-–—]{2,}/g, ', ')
+      .replace(/[|\\[\]{}()<>]/g, ' ')
+      // collapse whitespace
+      .replace(/\n+/g, ' ')
+      .replace(/\s{2,}/g, ' ')
+      .trim();
+    buf.current += clean;
+    const parts = buf.current.split(/(?<=[.!?])\s+/);
+    buf.current = parts.pop() ?? '';
+    for (const s of parts) { if (s.trim()) queue.current.push(s.trim()); }
+    if (!active.current) drain();
+  }, []);
+
+  const stopSpeech = useCallback((
+    queue: React.MutableRefObject<string[]>,
+    buf: React.MutableRefObject<string>,
+    active: React.MutableRefObject<boolean>,
+    cancelled: React.MutableRefObject<boolean>,
+    otherActive: React.MutableRefObject<boolean>,
+  ) => {
+    // Signal the drain loop to exit on its next tick (doesn't touch sibling).
+    cancelled.current = true;
+    // Only hard-cancel the browser TTS engine when THIS narrator owns
+    // the current utterance AND the sibling isn't also speaking.
+    if (active.current && !otherActive.current) {
+      window.speechSynthesis?.cancel();
+    }
+    queue.current = []; buf.current = ''; active.current = false;
+  }, []);
+
+  const stopNarratorSpeech = useCallback(
+    () => stopSpeech(sentenceQueue, ttsChunkBuf, ttsActive, ttsCancelled, nodeTtsActive), [stopSpeech]
+  );
+  const stopNodeNarratorSpeech = useCallback(
+    () => stopSpeech(nodeSentenceQueue, nodeTtsChunkBuf, nodeTtsActive, nodeTtsCancelled, ttsActive), [stopSpeech]
+  );
+
+  const toggleNarratorSpeech = useCallback(() => {
+    setNarratorSpeechOn(p => { if (p) stopNarratorSpeech(); return !p; });
+  }, [stopNarratorSpeech]);
+
+  const toggleNodeNarratorSpeech = useCallback(() => {
+    setNodeNarratorSpeechOn(p => { if (p) stopNodeNarratorSpeech(); return !p; });
+  }, [stopNodeNarratorSpeech]);
+
+  const toggleSpeech = useCallback(() => {
+    if (isSpeaking) { window.speechSynthesis.cancel(); setIsSpeaking(false); }
+    else if (explanation) {
+      const utt = new SpeechSynthesisUtterance(explanation.replace(/[#*`_]/g, ''));
+      utt.rate = 0.98;
+      utt.pitch = 1;
+      const voice = getPreferredVoice();
+      if (voice) utt.voice = voice;
+      utt.onend = () => setIsSpeaking(false);
+      utt.onerror = () => setIsSpeaking(false);
+      window.speechSynthesis.speak(utt);
+      setIsSpeaking(true);
+    }
+  }, [isSpeaking, explanation, getPreferredVoice]);
+
+  const bufRef = useRef<Map<string, any>>(new Map());
+  const flushTs = useRef(0);
+  const rawRef = useRef<{ nodes: any[]; edges: any[] }>({ nodes: [], edges: [] });
+  const expandPulseRef = useRef<{ nodeIds: Set<string>; edgeIds: Set<string> } | null>(null);
+  const expandPulseTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const expandNode = useCallback((nodeId: string) => {
+    setVisibleNodeIds(prev => {
+      const next = new Set(prev);
+      const added: string[] = [];
+      let count = 0;
+      for (const e of rawRef.current.edges) {
+        if (e.source === nodeId && !next.has(e.target) && count < 50) {
+          next.add(e.target);
+          added.push(e.target);
+          count++;
+        }
+      }
+      if (added.length > 0) {
+        const newEdgeIds = new Set(
+          rawRef.current.edges
+            .filter((ee: any) => ee.source === nodeId && added.includes(ee.target))
+            .map((ee: any) => ee.id)
+        );
+        expandPulseRef.current = { nodeIds: new Set(added), edgeIds: newEdgeIds };
+      }
+      return next;
+    });
+  }, []);
+
+  const expandFromNodes = useCallback((sourceNodeIds: string[]) => {
+    if (!sourceNodeIds.length) return;
+    setVisibleNodeIds(prev => {
+      const next = new Set(prev);
+      const added: string[] = [];
+      const sourceSet = new Set(sourceNodeIds);
+      let count = 0;
+      for (const e of rawRef.current.edges) {
+        if (sourceSet.has(e.source) && !next.has(e.target) && count < 80) {
+          next.add(e.target);
+          added.push(e.target);
+          count++;
+        }
+      }
+      if (added.length > 0) {
+        const newEdgeIds = new Set(
+          rawRef.current.edges
+            .filter((ee: any) => sourceSet.has(ee.source) && added.includes(ee.target))
+            .map((ee: any) => ee.id)
+        );
+        expandPulseRef.current = { nodeIds: new Set(added), edgeIds: newEdgeIds };
+      }
+      return next;
+    });
+  }, []);
+
+  // ── Commit graph ──────────────────────────────────────────────────────
+  const commit = useCallback(
+    (rn: any[], re: any[], visible: Set<string> = visibleNodeIds) => {
+      rawRef.current = { nodes: rn, edges: re };
+      const fn = rn.filter(n => visible.has(n.id) || n.type === 'fileGroup');
+      const fe = re.filter(e => visible.has(e.source) && visible.has(e.target));
+      const hiddenMap = new Set<string>();
+      for (const e of re) { if (visible.has(e.source) && !visible.has(e.target)) hiddenMap.add(e.source); }
+      const fnWithHidden = fn.map(n => ({ ...n, data: { ...n.data, hasHidden: hiddenMap.has(n.id) } }));
+
+      const layoutResult = treeLayout(fnWithHidden, fe);
+      let { nodes: ln, edges: le, clusters: lc } = layoutResult;
+
+      const pulse = expandPulseRef.current;
+      if (pulse) {
+        ln = ln.map((n: Node) => ({ ...n, data: { ...n.data, _expandPulse: pulse.nodeIds.has(n.id) } }));
+        le = le.map((e: Edge) => ({ ...e, data: { ...e.data, _expandPulse: pulse.edgeIds.has(e.id) } }));
+        expandPulseRef.current = null;
+        if (expandPulseTimeoutRef.current) clearTimeout(expandPulseTimeoutRef.current);
+        expandPulseTimeoutRef.current = setTimeout(() => {
+          expandPulseTimeoutRef.current = null;
+          setNodes((prev: Node[]) => prev.map(n => ({ ...n, data: { ...n.data, _expandPulse: false } })));
+          setEdges((prev: Edge[]) => prev.map(e => ({ ...e, data: { ...e.data, _expandPulse: false } })));
+        }, 2400);
+      }
+
+      masterNodes.current = ln;
+      masterEdges.current = le;
+      setNodes(ln);
+      setEdges(applyEdgeFocus(le, null));
+      setClusters(lc || []);
+      setStats({ n: ln.length, e: le.length });
+      setFocusId(null); setOutSet(new Set()); setInSet(new Set()); setSelectedNode(null);
+
+      requestAnimationFrame(() => {
+        const depth0 = ln.filter(n => ((n.data.depth ?? n.data.fileDepth ?? 99) as number) <= 1);
+        fitView({ nodes: depth0.length ? depth0 : undefined, duration: 500, padding: 0.18 });
+      });
+    },
+    [setNodes, setEdges, fitView, visibleNodeIds]
+  );
+
+  useEffect(() => {
+    if (rawRef.current.nodes.length > 0) commit(rawRef.current.nodes, rawRef.current.edges, visibleNodeIds);
+  }, [visibleNodeIds, commit]);
+
+  const clearFocus = useCallback(() => {
+    clearFocusRef.current();
+  }, []);
+
+  // ── File explorer ─────────────────────────────────────────────────────
+  useEffect(() => {
+    if (mode !== 'local') return;
+    axios.get(`${API_BASE}/files?path=${encodeURIComponent(path)}`)
+      .then(r => setFiles(r.data)).catch(() => setFiles([]));
+  }, [path, mode]);
+
+  // ── Node click ────────────────────────────────────────────────────────
+  const onNodeClick = useCallback((_: any, node: Node) => {
+    if (focusId === node.id) { clearFocus(); return; }
+    const newOut = new Set(masterEdges.current.filter(e => e.source === node.id).map(e => e.target));
+    const newIn = new Set(masterEdges.current.filter(e => e.target === node.id).map(e => e.source));
+    setFocusId(node.id); setOutSet(newOut); setInSet(newIn);
+    if (node.type !== 'fileGroup') { setSelectedNode(node); setExplanation(node?.data?.explanation ?? ''); }
+    setEdges(applyEdgeFocus(masterEdges.current, node.id));
+  }, [focusId, clearFocus, setEdges]);
+
+  const onNodeDoubleClick = useCallback((_: any, node: Node) => {
+    if (node.data.hasHidden) expandNode(node.id);
+  }, [expandNode]);
+
+  const onPaneClick = useCallback(() => { if (focusId) clearFocus(); }, [focusId, clearFocus]);
+
+  const autoEntry = useCallback((ns: Node[]) => {
+    const entry = ns.find(n => n.data.isEntry);
+    if (entry) setTimeout(() => onNodeClick(null, entry), 300);
+  }, [onNodeClick]);
+
+  // ── Analyze (Option C: job queue when available, else sync/WS fallback) ──
+  const analyze = async () => {
+    setBusy(true); setError(''); setNodes([]); setEdges([]);
+    masterNodes.current = []; masterEdges.current = [];
+    setFocusId(null); setOutSet(new Set()); setInSet(new Set());
+    setSelectedNode(null); setExplanation(''); setStats({ n: 0, e: 0 });
+    bufRef.current.clear();
+
+    const buildInitialVisible = (rn: any[], re: any[]) => {
+      const entry = rn.find((n: any) => {
+        const lb = (n.data.label ?? '').toLowerCase();
+        const fp = (n.data.filepath ?? '').toLowerCase();
+        return ENTRY_KW.has(lb) || [...ENTRY_KW].some(k => fp.match(new RegExp(`[/\\\\]${k}\\.(py|js|ts|tsx|java|rs)$`)));
+      }) ?? rn[0];
+      const vis = new Set<string>();
+      if (entry) {
+        vis.add(entry.id);
+        let c = 0;
+        for (const e of re) { if (e.source === entry.id && c < 50) { vis.add(e.target); c++; } }
+      }
+      if (vis.size === 0) { for (let i = 0; i < Math.min(100, rn.length); i++) vis.add(rn[i].id); }
+      return vis;
+    };
+
+    const applyGraphResult = (data: { nodes?: any[]; edges?: any[]; codebase_id?: string }) => {
+      const rn = data.nodes ?? []; const re = data.edges ?? [];
+      const vis = buildInitialVisible(rn, re);
+      setVisibleNodeIds(vis); commit(rn, re, vis);
+      autoEntry(treeLayout(rn, re).nodes);
+      if (data.codebase_id) setCodebaseId(data.codebase_id);
+    };
+
+    const newCodebaseId = crypto.randomUUID();
+    try {
+      // Option C: try job queue first (POST /jobs/analyze)
+      const jobPayload = mode === 'github'
+        ? { url: path, max_files: 200, codebase_id: newCodebaseId }
+        : { path, max_files: 200, codebase_id: newCodebaseId };
+      let useJobQueue = true;
+      try {
+        const jobRes = await axios.post(`${API_BASE}/jobs/analyze`, jobPayload);
+        const jobId = jobRes.data?.job_id;
+        if (jobId) {
+          useJobQueue = true;
+          let pollInterval = 2000;   // start at 2 s
+          const MAX_INTERVAL = 5000; // cap at 5 s
+
+          const pollStatus = async (): Promise<void> => {
+            const statusRes = await axios.get(`${API_BASE}/jobs/${jobId}/status`);
+            const st = statusRes.data?.status;
+            if (st === 'done') {
+              const resultRes = await axios.get(`${API_BASE}/jobs/${jobId}/result`);
+              const ref = resultRes.data;
+              // Result is now a slim reference { codebase_id, node_count, edge_count }
+              // Fetch the full graph from Postgres via /graph endpoint
+              if (ref?.codebase_id) {
+                const graphRes = await axios.get(`${API_BASE}/graph?codebase_id=${encodeURIComponent(ref.codebase_id)}`);
+                applyGraphResult({ ...graphRes.data, codebase_id: ref.codebase_id });
+              } else {
+                applyGraphResult(ref);
+              }
+              setBusy(false);
+              return;
+            }
+            if (st === 'failed') {
+              setError(statusRes.data?.error ?? 'Analysis failed');
+              setBusy(false);
+              return;
+            }
+            // Back off gradually up to MAX_INTERVAL
+            pollInterval = Math.min(pollInterval * 1.3, MAX_INTERVAL);
+            setTimeout(pollStatus, pollInterval);
+          };
+          await pollStatus();
+          return;
+        }
+      } catch (jobErr: any) {
+        if (jobErr.response?.status === 503) {
+          // Queue not configured — fall back to sync/WS
+        } else {
+          throw jobErr;
+        }
+      }
+
+      // Fallback: sync GET /analyze (local) or WebSocket (github)
+      if (mode === 'local') {
+        const r = await axios.get(`${API_BASE}/analyze?path=${encodeURIComponent(path)}&codebase_id=${encodeURIComponent(newCodebaseId)}`);
+        applyGraphResult(r.data);
+        setBusy(false);
+      } else if (mode === 'github') {
+        const ws = new WebSocket(`${WS_BASE}/ws/analyze/github`);
+        ws.onopen = () => ws.send(JSON.stringify({ url: path }));
+        ws.onmessage = ev => {
+          const d = JSON.parse(ev.data);
+          if (d.type === 'error') { setError(d.message); setBusy(false); ws.close(); return; }
+          if (d.type === 'update') {
+            for (const n of d.nodes ?? []) bufRef.current.set(n.id, n);
+            const now = Date.now();
+            if (now - flushTs.current > 500) { setStats(s => ({ ...s, n: bufRef.current.size })); flushTs.current = now; }
+          }
+          if (d.type === 'complete') {
+            applyGraphResult(d.graph ?? {});
+            setBusy(false); ws.close();
+          }
+        };
+        ws.onerror = () => { setError('WebSocket error — backend running?'); setBusy(false); };
+        return;
+      }
+    } catch (e: any) {
+      setError(e.response?.data?.detail ?? e.message ?? 'Request failed'); setBusy(false);
+    }
+  };
+
+  const loadSavedAnalyses = useCallback(() => {
+    axios.get<{ codebase_id: string; source_path: string; created_at: string | null }[]>(`${API_BASE}/analyses`)
+      .then(r => setSavedAnalyses(r.data ?? []))
+      .catch(() => setSavedAnalyses([]));
+  }, []);
+
+  const loadGraphByCodebaseId = useCallback(async (id: string) => {
+    setBusy(true); setError('');
+    try {
+      const r = await axios.get(`${API_BASE}/graph?codebase_id=${encodeURIComponent(id)}`);
+      const rn = r.data?.nodes ?? []; const re = r.data?.edges ?? [];
+      const entry = rn.find((n: any) => (n.data?.label ?? '').toLowerCase().includes('main') || (n.data?.filepath ?? '').toLowerCase().includes('main'));
+      const vis = new Set<string>();
+      if (entry) {
+        vis.add(entry.id);
+        for (const e of re) { if (e.source === entry.id && vis.size < 80) vis.add(e.target); }
+      }
+      if (vis.size === 0) for (let i = 0; i < Math.min(100, rn.length); i++) vis.add(rn[i].id);
+      setVisibleNodeIds(vis);
+      commit(rn, re, vis);
+      autoEntry(treeLayout(rn, re).nodes);
+      setCodebaseId(id);
+    } catch (e: any) {
+      setError(e.response?.data?.detail ?? e.message ?? 'Load failed');
+    } finally {
+      setBusy(false);
+    }
+  }, [commit, autoEntry]);
+
+  // ── AI explain ────────────────────────────────────────────────────────
+  const explain = useCallback(() => {
+    if (!selectedNode) return;
+    if (selectedNode.data?.explanation) {
+      setExplanation(selectedNode.data.explanation);
+      setAiStreaming(false);
+      return;
+    }
+    setAiStreaming(true); setExplanation('');
+    const edges = masterEdges.current;
+    const nodeList = masterNodes.current;
+    const getLabel = (id: string) => nodeList.find((n: any) => n.id === id)?.data?.label ?? id;
+    const callees = edges.filter((e: any) => e.source === selectedNode.id).map((e: any) => getLabel(e.target));
+    const callers = edges.filter((e: any) => e.target === selectedNode.id).map((e: any) => getLabel(e.source));
+    const ws = new WebSocket(`${WS_BASE}/ws/explain`);
+    ws.onopen = () => ws.send(JSON.stringify({
+      code: selectedNode.data.code,
+      context: selectedNode.data.filepath,
+      callers,
+      callees,
+    }));
+    ws.onmessage = ev => setExplanation(p => p + ev.data);
+    ws.onclose = () => setAiStreaming(false);
+    ws.onerror = () => { setExplanation('Unable to generate explanation. Check backend and Ollama or Hugging Face token.'); setAiStreaming(false); };
+  }, [selectedNode]);
+
+  // ── Generic WS narration handler ──────────────────────────────────────
+  // Builds the onmessage handler. Uses applyFocusRef so the focus call
+  // always sees the latest masterNodes/masterEdges even though the WS
+  // closure is created once and never recreated.
+  const makeNarrationHandler = useCallback((
+    setText: React.Dispatch<React.SetStateAction<string>>,
+    speechRef: React.MutableRefObject<boolean>,
+    buf: React.MutableRefObject<string>,
+    queue: React.MutableRefObject<string[]>,
+    active: React.MutableRefObject<boolean>,
+    drain: () => void,
+  ) => (ev: MessageEvent) => {
+    try {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === 'focus') {
+        // ← THE FIX: call through the ref, never a stale closure
+        applyFocusRef.current(msg.node_id);
+        return;
+      }
+      if (msg.type === 'text') {
+        setText(p => p + msg.chunk);
+        enqueueChunk(msg.chunk, speechRef, buf, queue, active, drain);
+      }
+    } catch { setText(p => p + ev.data); }
+  }, [enqueueChunk]);
+
+  // ── Codebase Tour ─────────────────────────────────────────────────────
+  const { setNarrating: setTourNarrating, registerNarratorWs } = useTour();
+  const startNarration = useCallback(() => {
+    if (rawRef.current.nodes.length === 0) return;
+    setIsNarrating(true); setNarration(''); setShowNarrator(true);
+    setTourNarrating(true);
+    stopNarratorSpeech(); ttsCancelled.current = false; sentenceQueue.current = []; ttsChunkBuf.current = '';
+
+    const ws = new WebSocket(`${WS_BASE}/ws/narrate`);
+    registerNarratorWs(ws);
+    ws.onmessage = makeNarrationHandler(
+      setNarration, narratorSpeechRef, ttsChunkBuf, sentenceQueue, ttsActive, drainSentenceQueue
+    );
+    ws.onclose = () => {
+      registerNarratorWs(null);
+      setTourNarrating(false);
+      if (ttsChunkBuf.current.trim()) { sentenceQueue.current.push(ttsChunkBuf.current.trim()); ttsChunkBuf.current = ''; if (!ttsActive.current) drainSentenceQueue(); }
+      setIsNarrating(false);
+    };
+    ws.onerror = () => { setNarration(p => p + '\n\n❌ Connection error.'); registerNarratorWs(null); setTourNarrating(false); setIsNarrating(false); };
+  }, [makeNarrationHandler, stopNarratorSpeech, drainSentenceQueue, setTourNarrating, registerNarratorWs]);
+
+  // ── Per-node narrator ─────────────────────────────────────────────────
+  const startNodeNarration = useCallback(() => {
+    if (!selectedNode) return;
+    setIsNodeNarrating(true); setNodeNarration(''); setShowNodeNarrator(true);
+    stopNodeNarratorSpeech(); nodeTtsCancelled.current = false; nodeSentenceQueue.current = []; nodeTtsChunkBuf.current = '';
+
+    const ws = new WebSocket(`${WS_BASE}/ws/narrate/node`);
+    ws.onopen = () => ws.send(JSON.stringify({ node_id: selectedNode.id }));
+    ws.onmessage = makeNarrationHandler(
+      setNodeNarration, nodeNarratorSpeechRef, nodeTtsChunkBuf, nodeSentenceQueue, nodeTtsActive, drainNodeSentenceQueue
+    );
+    ws.onclose = () => {
+      if (nodeTtsChunkBuf.current.trim()) { nodeSentenceQueue.current.push(nodeTtsChunkBuf.current.trim()); nodeTtsChunkBuf.current = ''; if (!nodeTtsActive.current) drainNodeSentenceQueue(); }
+      setIsNodeNarrating(false);
+    };
+    ws.onerror = () => { setNodeNarration(p => p + '\n\n❌ Connection error.'); setIsNodeNarrating(false); };
+  }, [selectedNode, makeNarrationHandler, stopNodeNarratorSpeech, drainNodeSentenceQueue]);
+
+  const syLang = (fp = '') =>
+    fp.endsWith('.py') ? 'python'
+      : fp.endsWith('.ts') || fp.endsWith('.tsx') ? 'typescript'
+        : fp.endsWith('.java') ? 'java'
+          : fp.endsWith('.rs') ? 'rust'
+            : 'javascript';
+
+  const onMemberClick = useCallback((m: any) => {
+    setSelectedNode({ id: m.id, type: m.type, position: { x: 0, y: 0 }, data: { label: m.name, filepath: m.filepath, type: m.type, code: m.code, start_line: m.start_line, end_line: m.end_line, explanation: (m as any).explanation } });
+    setExplanation((m as any).explanation ?? '');
+    const parentId = `file::${m.filepath}`;
+    if (focusId !== parentId) {
+      setFocusId(parentId);
+      setOutSet(new Set(masterEdges.current.filter(e => e.source === parentId).map(e => e.target)));
+      setInSet(new Set(masterEdges.current.filter(e => e.target === parentId).map(e => e.source)));
+      setEdges(applyEdgeFocus(masterEdges.current, parentId));
+    }
+  }, [focusId, setEdges]);
+
+  return (
+    <FocusCtx.Provider value={focusCtxValue}>
+      <div style={{ display: 'flex', height: '100vh', width: '100vw', overflow: 'hidden' }}>
+
+        {/* ── SIDEBAR ─────────────────────────────────────────────────── */}
+        <motion.div className="ez-sidebar" initial={{ x: -268, opacity: 0 }} animate={{ x: 0, opacity: 1 }} transition={{ duration: 0.32, ease: [0.22, 1, 0.36, 1] }}>
+          <div style={{ padding: '13px 15px', borderBottom: '1px solid var(--ln)', display: 'flex', alignItems: 'center', gap: 9 }}>
+            <div style={{ width: 26, height: 26, borderRadius: 6, background: 'var(--bl)', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 0 14px rgba(59,130,246,.4)', flexShrink: 0 }}>
+              <Search size={12} color="#fff" />
+            </div>
+            <span style={{ fontFamily: 'var(--ui)', fontWeight: 700, fontSize: 14, color: 'var(--t1)', letterSpacing: '-.02em' }}>EzDocs</span>
+            <code style={{ marginLeft: 'auto', fontSize: 8, padding: '2px 6px', borderRadius: 4, background: 'var(--bld)', color: '#93c5fd', border: '1px solid rgba(59,130,246,.2)', letterSpacing: '.07em' }}>BETA</code>
+          </div>
+
+          <div style={{ padding: 12, display: 'flex', flexDirection: 'column', gap: 9, borderBottom: '1px solid var(--ln)' }}>
+            <div style={{ display: 'flex', gap: 2, background: 'rgba(0,0,0,.45)', borderRadius: 6, padding: 2 }}>
+              {(['local', 'github', 'upload'] as const).map(m => (
+                <button key={m} className={`ez-tab ${mode === m ? 'on' : 'off'}`} onClick={() => setMode(m)}>{m}</button>
+              ))}
+            </div>
+            <div style={{ position: 'relative' }}>
+              <div style={{ position: 'absolute', left: 9, top: '50%', transform: 'translateY(-50%)', color: 'var(--t3)', pointerEvents: 'none' }}>
+                {mode === 'github' ? <GitBranch size={11} /> : <Folder size={11} />}
+              </div>
+              <input className="ez-inp" value={path} onChange={e => setPath(e.target.value)} onKeyDown={e => e.key === 'Enter' && analyze()} placeholder={mode === 'github' ? 'github.com/owner/repo' : './path/to/project'} />
+            </div>
+            <button className="ez-run" onClick={analyze} disabled={busy}>
+              {busy ? <Activity size={13} className="ez-spin" /> : <Play size={12} fill="currentColor" />}
+              {busy ? (stats.n > 0 ? `${stats.n} nodes…` : 'Analyzing…') : 'Run Analysis'}
+            </button>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              <button type="button" onClick={() => { loadSavedAnalyses(); }} disabled={busy}
+                style={{ fontSize: 10, color: 'var(--t3)', background: 'none', border: '1px solid var(--ln)', borderRadius: 6, padding: '6px 10px', cursor: 'pointer', fontFamily: 'var(--ui)' }}>
+                Load saved graph
+              </button>
+              {savedAnalyses.length > 0 && (
+                <ul style={{ listStyle: 'none', padding: 0, margin: 0, display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 160, overflowY: 'auto' }}>
+                  {savedAnalyses.slice(0, 15).map(a => (
+                    <li key={a.codebase_id}>
+                      <button type="button" onClick={() => loadGraphByCodebaseId(a.codebase_id)} disabled={busy}
+                        style={{ width: '100%', textAlign: 'left', fontSize: 9, color: 'var(--t2)', background: 'var(--c2)', border: '1px solid var(--ln)', borderRadius: 4, padding: '5px 8px', cursor: 'pointer', fontFamily: 'var(--mono)' }}
+                        title={a.source_path}>
+                        {a.source_path.split(/[/\\]/).filter(Boolean).pop() || a.source_path || a.codebase_id.slice(0, 8)}
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+            {error && (
+              <div style={{ display: 'flex', gap: 6, alignItems: 'flex-start', background: 'rgba(244,63,94,.08)', border: '1px solid rgba(244,63,94,.22)', borderRadius: 6, padding: '7px 9px', fontSize: 10, color: '#fda4af', lineHeight: 1.5 }}>
+                <AlertCircle size={11} style={{ marginTop: 1, flexShrink: 0 }} />{error}
+              </div>
+            )}
+          </div>
+
+          <div className="ez-s" style={{ flex: 1, overflowY: 'auto', padding: '8px 5px' }}>
+            <div style={{ fontSize: 8.5, fontWeight: 700, color: 'var(--t4)', letterSpacing: '.13em', textTransform: 'uppercase', padding: '0 5px', marginBottom: 7 }}>Explorer</div>
+            {files.length ? files.map(f => <FileItem key={f.path} {...f} depth={0} />) : (
+              <div style={{ fontSize: 10, color: 'var(--t3)', padding: '5px 8px', fontStyle: 'italic' }}>
+                {mode === 'local' ? 'Enter a path above…' : 'Local mode only'}
+              </div>
+            )}
+          </div>
+
+          <div style={{ borderTop: '1px solid var(--ln)', padding: '9px 13px', display: 'flex', alignItems: 'center' }}>
+            {focusId && <button onClick={clearFocus} style={{ fontSize: 10, color: '#93c5fd', background: 'none', border: 'none', cursor: 'pointer', fontFamily: 'var(--mono)', padding: 0 }}>← all nodes</button>}
+            <span style={{ marginLeft: 'auto', fontSize: 9, color: 'var(--t3)', fontVariantNumeric: 'tabular-nums' }}>{stats.n > 0 ? `${stats.n}n · ${stats.e}e` : 'no graph'}</span>
+          </div>
+        </motion.div>
+
+        {/* ── GRAPH ───────────────────────────────────────────────────── */}
+        <div style={{ flex: 1, position: 'relative', minWidth: 0 }}>
+          <MemberClickCtx.Provider value={onMemberClick}>
+            {/* Dynamic by-file shading (viewport-transformed so it tracks zoom/pan/drag) */}
+            {(() => {
+              const { x, y, zoom } = viewport;
+              const PAD = 10;
+              const toScreen = (fx: number, fy: number, fw: number, fh: number) => ({
+                left: x + (fx - PAD) * zoom,
+                top: y + (fy - PAD) * zoom,
+                width: (fw + PAD * 2) * zoom,
+                height: (fh + PAD * 2) * zoom,
+              });
+              if (clusters.length > 0) {
+                return (
+                  <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none', zIndex: 0 }}>
+                    {clusters.map((cluster) => {
+                      const b = cluster.bounds;
+                      const screen = toScreen(b.x, b.y, b.width, b.height);
+                      const isFocused = focusId && nodes.find(n => n.id === focusId)?.data.cluster === cluster.filepath;
+                      const isConnected = focusId && edges.some(e =>
+                        (e.source === focusId && nodes.find(n => n.id === e.target)?.data.cluster === cluster.filepath) ||
+                        (e.target === focusId && nodes.find(n => n.id === e.source)?.data.cluster === cluster.filepath)
+                      );
+                      const bg = isFocused ? cluster.color.replace(/[\d.]+\)$/, '0.28)') : isConnected ? cluster.color.replace(/[\d.]+\)$/, '0.16)') : cluster.color;
+                      return (
+                        <div
+                          key={cluster.id}
+                          style={{
+                            position: 'absolute',
+                            left: screen.left,
+                            top: screen.top,
+                            width: screen.width,
+                            height: screen.height,
+                            background: bg,
+                            borderRadius: 12,
+                            transition: 'all 0.2s ease',
+                          }}
+                        />
+                      );
+                    })}
+                  </div>
+                );
+              }
+              return null;
+            })()}
+
+            <div style={{ position: 'absolute', inset: 0, zIndex: 1 }}>
+              <ReactFlow
+                nodes={nodes} edges={edges}
+                onNodesChange={onNodesChange} onEdgesChange={onEdgesChange}
+                nodeTypes={NODE_TYPES} edgeTypes={EDGE_TYPES}
+                onNodeClick={onNodeClick} onNodeDoubleClick={onNodeDoubleClick} onPaneClick={onPaneClick}
+                fitView fitViewOptions={{ padding: 0.12 }}
+                minZoom={0.03} maxZoom={4}
+                nodesFocusable={false} edgesFocusable={false} elementsSelectable={true} selectNodesOnDrag={false} nodesConnectable={false}
+                onlyRenderVisibleElements={true} panOnDrag={true} panOnScroll={false}
+                zoomOnScroll={true} zoomOnPinch={true} zoomOnDoubleClick={false}
+                defaultEdgeOptions={{ type: 'ez', animated: false, focusable: false }}
+                style={{ background: 'var(--c0)' }}
+              >
+                <Background gap={24} size={1} color="#1e293b" style={{ opacity: 0.4 }} variant="dots" />
+                <CustomZoomControls />
+
+                <Panel position="top-right">
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                    {nodes.length > 0 && (
+                      <button onClick={startNarration} disabled={isNarrating}
+                        style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6, padding: '8px 14px', borderRadius: 8, border: '1px solid rgba(139,92,246,0.5)', background: isNarrating ? 'rgba(139,92,246,0.25)' : 'linear-gradient(135deg, rgba(139,92,246,0.18), rgba(167,139,250,0.18))', color: '#a78bfa', cursor: isNarrating ? 'not-allowed' : 'pointer', fontSize: 10, fontWeight: 700, letterSpacing: '.05em', fontFamily: 'var(--mono)', transition: 'all .15s', boxShadow: '0 2px 8px rgba(139,92,246,0.25)' }}
+                        onMouseEnter={e => !isNarrating && (e.currentTarget.style.background = 'rgba(139,92,246,0.3)')}
+                        onMouseLeave={e => !isNarrating && (e.currentTarget.style.background = 'linear-gradient(135deg, rgba(139,92,246,0.18), rgba(167,139,250,0.18))')}
+                      >
+                        {isNarrating ? <><Activity size={11} className="ez-spin" />NARRATING...</> : <><Volume2 size={11} />START TOUR</>}
+                      </button>
+                    )}
+                  </div>
+                </Panel>
+
+                <Panel position="bottom-left">
+                  <div style={{ background: 'rgba(11,16,23,.88)', backdropFilter: 'blur(8px)', border: '1px solid var(--ln)', borderRadius: 6, padding: '4px 9px', fontSize: 8.5, color: 'var(--t3)', letterSpacing: '.05em' }}>
+                    scroll=zoom · drag=pan · click=focus
+                  </div>
+                </Panel>
+
+                {focusId && (
+                  <Panel position="top-center">
+                    <motion.div initial={{ y: -12, opacity: 0 }} animate={{ y: 0, opacity: 1 }}
+                      style={{ marginTop: 8, background: 'rgba(11,16,23,.92)', backdropFilter: 'blur(10px)', border: '1px solid var(--ln2)', borderRadius: 10, padding: '7px 16px', display: 'flex', alignItems: 'center', gap: 10, boxShadow: '0 8px 28px rgba(0,0,0,.5)' }}>
+                      <Activity size={10} style={{ color: 'var(--bl)' }} />
+                      <span style={{ fontSize: 11, color: 'var(--t2)' }}>Focus: <b style={{ color: 'var(--t1)', fontFamily: 'var(--mono)' }}>{selectedNode?.data.label}</b></span>
+                      <button onClick={clearFocus} style={{ fontSize: 9.5, padding: '2px 9px', borderRadius: 4, border: '1px solid var(--ln2)', background: 'var(--bld)', color: '#93c5fd', cursor: 'pointer', fontFamily: 'var(--mono)' }}>× reset</button>
+                    </motion.div>
+                  </Panel>
+                )}
+
+                {nodes.length === 0 && !busy && (
+                  <Panel position="top-center">
+                    <div style={{ marginTop: '17vh', textAlign: 'center', userSelect: 'none' }}>
+                      <div style={{ fontSize: 48, opacity: 0.04, marginBottom: 14 }}>⬡</div>
+                      <div style={{ fontSize: 13, color: 'var(--t3)', fontFamily: 'var(--ui)', fontWeight: 600 }}>No graph loaded</div>
+                      <div style={{ fontSize: 10, color: 'var(--t4)', marginTop: 5 }}>Enter a path → Run Analysis</div>
+                    </div>
+                  </Panel>
+                )}
+                {busy && nodes.length === 0 && (
+                  <Panel position="top-center">
+                    <div style={{ marginTop: '17vh', textAlign: 'center' }}>
+                      <Activity size={20} className="ez-spin" style={{ color: 'var(--bl)', margin: '0 auto 10px' }} />
+                      <div style={{ fontSize: 11, color: 'var(--t2)', fontFamily: 'var(--ui)' }}>{stats.n > 0 ? `Streaming… ${stats.n} nodes` : 'Building call tree…'}</div>
+                    </div>
+                  </Panel>
+                )}
+              </ReactFlow>
+            </div>
+
+            {/* Cluster labels (backgrounds are in the shading layer above) */}
+            {clusters.length > 0 && (() => {
+              const { x, y, zoom } = viewport;
+              return (
+                <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none', zIndex: 2 }}>
+                  {clusters.map(cluster => {
+                    const isFocused = focusId && nodes.find(n => n.id === focusId)?.data.cluster === cluster.filepath;
+                    const isConnected = focusId && edges.some(e =>
+                      (e.source === focusId && nodes.find(n => n.id === e.target)?.data.cluster === cluster.filepath) ||
+                      (e.target === focusId && nodes.find(n => n.id === e.source)?.data.cluster === cluster.filepath)
+                    );
+                    const labelLeft = x + (cluster.bounds.x + 8) * zoom;
+                    const labelTop = y + (cluster.bounds.y - 22) * zoom;
+                    return (
+                      <div
+                        key={cluster.id}
+                        style={{
+                          position: 'absolute',
+                          left: labelLeft,
+                          top: labelTop,
+                          fontSize: 10,
+                          fontWeight: 600,
+                          color: isFocused ? '#93c5fd' : isConnected ? 'var(--t2)' : 'var(--t3)',
+                          fontFamily: 'var(--mono)',
+                          letterSpacing: '.05em',
+                          opacity: isFocused || isConnected ? 1 : 0.6,
+                          transition: 'all 0.2s ease',
+                          textShadow: '0 1px 2px rgba(0,0,0,0.5)',
+                        }}
+                      >
+                        📁 {cluster.filepath.split('/').pop()?.split('\\').pop() || cluster.filepath}
+                        {cluster.depth === 0 && <span style={{ marginLeft: 5, fontSize: 8, padding: '1px 4px', borderRadius: 3, background: 'rgba(20,184,166,0.2)', border: '1px solid rgba(20,184,166,0.4)', color: 'var(--tl)', verticalAlign: 'middle' }}>ENTRY</span>}
+                        {(cluster.depth ?? 0) > 0 && <span style={{ marginLeft: 5, fontSize: 8, padding: '1px 4px', borderRadius: 3, background: 'rgba(0,0,0,0.3)', color: 'var(--t4)', verticalAlign: 'middle' }}>d{cluster.depth}</span>}
+                      </div>
+                    );
+                  })}
+                </div>
+              );
+            })()}
+          </MemberClickCtx.Provider>
+        </div>
+
+        {/* ── DETAIL PANEL ────────────────────────────────────────────── */}
+        <AnimatePresence>
+          {selectedNode && (
+            <motion.div key="dp" initial={{ x: 420, opacity: 0 }} animate={{ x: 0, opacity: 1 }} exit={{ x: 420, opacity: 0 }} transition={{ type: 'spring', damping: 32, stiffness: 280 }}
+              style={{ width: 420, borderLeft: '1px solid var(--ln)', background: 'var(--c1)', display: 'flex', flexDirection: 'column', position: 'absolute', right: 0, top: 0, bottom: 0, zIndex: 40, boxShadow: '-20px 0 60px rgba(0,0,0,.65)' }}>
+
+              <div style={{ height: 50, padding: '0 14px', borderBottom: '1px solid var(--ln)', display: 'flex', alignItems: 'center', gap: 9, flexShrink: 0 }}>
+                <div style={{ padding: '4px 5px', borderRadius: 5, background: selectedNode.data.type === 'class' ? 'rgba(245,158,11,.1)' : 'var(--bld)', border: `1px solid ${selectedNode.data.type === 'class' ? 'rgba(245,158,11,.25)' : 'rgba(59,130,246,.25)'}` }}>
+                  {selectedNode.data.type === 'class' ? <Layers size={11} style={{ color: 'var(--am)' }} /> : <Terminal size={11} style={{ color: 'var(--bl)' }} />}
+                </div>
+                <div style={{ flex: 1, overflow: 'hidden' }}>
+                  <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--t1)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{selectedNode.data.label}</div>
+                  <div style={{ fontSize: 8.5, color: 'var(--t3)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{selectedNode.data.filepath}&nbsp;·&nbsp;L{selectedNode.data.start_line}–{selectedNode.data.end_line}</div>
+                </div>
+                <button onClick={() => { setSelectedNode(null); clearFocus(); }} style={{ background: 'none', border: 'none', color: 'var(--t3)', cursor: 'pointer', padding: 4, borderRadius: 4, lineHeight: 0 }} onMouseEnter={e => (e.currentTarget.style.color = 'var(--t1)')} onMouseLeave={e => (e.currentTarget.style.color = 'var(--t3)')}>
+                  <X size={14} />
+                </button>
+              </div>
+
+              <div className="ez-s" style={{ flex: 1, overflowY: 'auto' }}>
+                <SyntaxHighlighter language={syLang(selectedNode.data.filepath)} style={oneDark} customStyle={{ margin: 0, padding: '16px 18px', fontSize: 10, lineHeight: 1.75, background: 'transparent', fontFamily: 'var(--mono)' }} showLineNumbers lineNumberStyle={{ color: 'var(--t4)', minWidth: 26 }} startingLineNumber={selectedNode.data.start_line || 1}>
+                  {selectedNode.data.code || '// no source'}
+                </SyntaxHighlighter>
+
+                <div style={{ borderTop: '1px solid var(--ln)', padding: '14px 16px', background: 'rgba(0,0,0,.22)' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 9.5, fontWeight: 700, color: 'var(--t2)', letterSpacing: '.08em', textTransform: 'uppercase' }}>
+                      <Cpu size={10} style={{ color: 'var(--bl)' }} />AI Analysis
+                    </div>
+                    <div style={{ display: 'flex', gap: 6 }}>
+                      {(selectedNode.data.hasHidden || (selectedNode.type === 'fileGroup' && selectedNode.data.hasAnyHidden)) && (
+                        <button
+                          onClick={() => {
+                            if (selectedNode.type === 'fileGroup' && selectedNode.data.hasAnyHidden) {
+                              const ids = (selectedNode.data.members as { id: string; hasHidden?: boolean }[]).filter(m => m.hasHidden).map(m => m.id);
+                              expandFromNodes(ids);
+                            } else {
+                              expandNode(selectedNode.id);
+                            }
+                          }}
+                          style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 9.5, padding: '3px 9px', borderRadius: 5, border: '1px solid rgba(20,184,166,0.5)', background: 'rgba(20,184,166,0.1)', color: '#5eead4', cursor: 'pointer', fontWeight: 600, fontFamily: 'var(--mono)' }}
+                          onMouseEnter={e => (e.currentTarget.style.background = 'rgba(20,184,166,0.2)')}
+                          onMouseLeave={e => (e.currentTarget.style.background = 'rgba(20,184,166,0.1)')}
+                        >
+                          <Plus size={10} />Expand Nodes
+                        </button>
+                      )}
+                      {explanation && !aiStreaming && (
+                        <button onClick={toggleSpeech} style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 9.5, padding: '3px 9px', borderRadius: 5, border: '1px solid var(--ln2)', background: isSpeaking ? 'var(--bld)' : 'transparent', color: isSpeaking ? '#93c5fd' : 'var(--t2)', cursor: 'pointer', fontWeight: 600, fontFamily: 'var(--mono)' }} onMouseEnter={e => (e.currentTarget.style.color = '#93c5fd')} onMouseLeave={e => (e.currentTarget.style.color = isSpeaking ? '#93c5fd' : 'var(--t2)')}>
+                          <Volume2 size={10} style={{ opacity: isSpeaking ? 1 : 0.7 }} />{isSpeaking ? 'Stop' : 'Narrate'}
+                        </button>
+                      )}
+                      {!explanation && !aiStreaming && (
+                        <button onClick={explain} style={{ fontSize: 9.5, padding: '3px 11px', borderRadius: 5, border: '1px solid var(--ln2)', background: 'var(--bld)', color: '#93c5fd', cursor: 'pointer', fontWeight: 600, fontFamily: 'var(--mono)' }} onMouseEnter={e => (e.currentTarget.style.background = 'var(--blg)')} onMouseLeave={e => (e.currentTarget.style.background = 'var(--bld)')}>
+                          Generate
+                        </button>
+                      )}
+                    </div>
+                    {aiStreaming && <span style={{ fontSize: 9, color: 'var(--t3)', display: 'flex', alignItems: 'center', gap: 4 }}><Activity size={9} className="ez-spin" />Streaming…</span>}
+                  </div>
+                  {explanation ? (
+                    <div style={{ fontSize: 11, color: 'var(--t2)', lineHeight: 1.85 }}><ReactMarkdown>{explanation}</ReactMarkdown></div>
+                  ) : (
+                    <div style={{ height: 80, display: 'flex', alignItems: 'center', justifyContent: 'center', border: '1px dashed var(--ln2)', borderRadius: 6 }}>
+                      <span style={{ fontSize: 10, color: 'var(--t3)' }}>{aiStreaming ? 'Generating…' : 'Click Generate to explain'}</span>
+                    </div>
+                  )}
+                </div>
+
+                {/* Explain This Node button */}
+                <div style={{ padding: '12px 16px', borderTop: '1px solid var(--ln)', background: 'rgba(0,0,0,.15)' }}>
+                  <button onClick={startNodeNarration} disabled={isNodeNarrating}
+                    style={{ width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 7, padding: '9px 14px', borderRadius: 8, border: '1px solid rgba(139,92,246,0.4)', background: isNodeNarrating ? 'rgba(139,92,246,0.2)' : 'linear-gradient(135deg, rgba(139,92,246,0.12), rgba(167,139,250,0.12))', color: '#a78bfa', cursor: isNodeNarrating ? 'not-allowed' : 'pointer', fontSize: 10, fontWeight: 700, letterSpacing: '.06em', fontFamily: 'var(--mono)', transition: 'all .15s', boxShadow: '0 2px 10px rgba(139,92,246,0.15)' }}
+                    onMouseEnter={e => !isNodeNarrating && (e.currentTarget.style.background = 'rgba(139,92,246,0.22)')}
+                    onMouseLeave={e => !isNodeNarrating && (e.currentTarget.style.background = 'linear-gradient(135deg, rgba(139,92,246,0.12), rgba(167,139,250,0.12))')}
+                  >
+                    {isNodeNarrating ? <><Activity size={11} className="ez-spin" />DEEP-DIVING...</> : <><Microscope size={11} />EXPLAIN THIS NODE</>}
+                  </button>
+                </div>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* ── CODEBASE TOUR NARRATOR PANEL ─────────────────────────────── */}
+        <AnimatePresence>
+          {showNarrator && (
+            <motion.div key="narrator" initial={{ y: 600, opacity: 0 }} animate={{ y: 0, opacity: 1 }} exit={{ y: 600, opacity: 0 }} transition={{ type: 'spring', damping: 28, stiffness: 260 }}
+              style={{ position: 'absolute', left: 20, right: selectedNode ? 440 : 20, bottom: 20, maxHeight: '40vh', minHeight: 200, background: 'linear-gradient(145deg, rgba(17,23,32,0.95), rgba(11,16,23,0.98))', backdropFilter: 'blur(16px)', WebkitBackdropFilter: 'blur(16px)', border: '1px solid rgba(139,92,246,0.4)', borderRadius: 12, padding: '16px 20px', boxShadow: '0 -10px 60px rgba(139,92,246,0.2)', display: 'flex', flexDirection: 'column', zIndex: 30, overflow: 'hidden' }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12, paddingBottom: 10, borderBottom: '1px solid rgba(139,92,246,0.25)' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <div style={{ width: 28, height: 28, borderRadius: 6, background: 'linear-gradient(135deg, rgba(139,92,246,0.25), rgba(167,139,250,0.25))', border: '1px solid rgba(139,92,246,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}><Volume2 size={14} style={{ color: '#a78bfa' }} /></div>
+                  <div>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: '#a78bfa' }}>AI Narrator</div>
+                    <div style={{ fontSize: 9, color: 'var(--t3)', marginTop: 1 }}>{isNarrating ? 'Exploring codebase...' : 'Tour complete'}</div>
+                  </div>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <button onClick={toggleNarratorSpeech} style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 9.5, padding: '4px 9px', borderRadius: 5, border: `1px solid ${narratorSpeechOn ? 'rgba(139,92,246,0.5)' : 'var(--ln2)'}`, background: narratorSpeechOn ? 'rgba(139,92,246,0.15)' : 'transparent', color: narratorSpeechOn ? '#a78bfa' : 'var(--t3)', cursor: 'pointer', fontWeight: 600, fontFamily: 'var(--mono)' }}>
+                    {narratorSpeechOn ? <Volume2 size={11} /> : <VolumeX size={11} />}{narratorSpeechOn ? 'Voice On' : 'Voice Off'}
+                  </button>
+                  <button onClick={() => { setShowNarrator(false); stopNarratorSpeech(); }} style={{ background: 'none', border: 'none', color: 'var(--t3)', cursor: 'pointer', padding: 4, borderRadius: 4, lineHeight: 0 }} onMouseEnter={e => (e.currentTarget.style.color = '#a78bfa')} onMouseLeave={e => (e.currentTarget.style.color = 'var(--t3)')}>
+                    <X size={16} />
+                  </button>
+                </div>
+              </div>
+              <div className="ez-s" style={{ flex: 1, overflowY: 'auto', fontSize: 11.5, lineHeight: 1.8, color: 'var(--t2)', paddingRight: 8 }}>
+                {narration ? <ReactMarkdown>{narration}</ReactMarkdown> : (
+                  <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--t3)', fontStyle: 'italic' }}>
+                    {isNarrating ? <div style={{ textAlign: 'center' }}><Activity size={20} className="ez-spin" style={{ color: '#a78bfa', marginBottom: 10 }} /><div>Starting narration...</div></div> : 'Click "Start Tour" to begin'}
+                  </div>
+                )}
+              </div>
+              {narration && !isNarrating && (
+                <div style={{ marginTop: 12, paddingTop: 10, borderTop: '1px solid rgba(139,92,246,0.25)', display: 'flex', justifyContent: 'flex-end' }}>
+                  <button onClick={() => { setNarration(''); startNarration(); }} style={{ fontSize: 10, padding: '5px 12px', borderRadius: 6, border: '1px solid rgba(139,92,246,0.4)', background: 'rgba(139,92,246,0.12)', color: '#a78bfa', cursor: 'pointer', fontWeight: 600, fontFamily: 'var(--mono)' }} onMouseEnter={e => (e.currentTarget.style.background = 'rgba(139,92,246,0.22)')} onMouseLeave={e => (e.currentTarget.style.background = 'rgba(139,92,246,0.12)')}>🔄 Restart Tour</button>
+                </div>
+              )}
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* ── PER-NODE NARRATOR PANEL ───────────────────────────────────── */}
+        <AnimatePresence>
+          {showNodeNarrator && (
+            <motion.div key="node-narrator" initial={{ y: 600, opacity: 0 }} animate={{ y: 0, opacity: 1 }} exit={{ y: 600, opacity: 0 }} transition={{ type: 'spring', damping: 28, stiffness: 260 }}
+              style={{ position: 'absolute', left: 20, right: selectedNode ? 440 : 20, bottom: showNarrator ? 'calc(40vh + 30px)' : 20, maxHeight: '40vh', minHeight: 200, background: 'linear-gradient(145deg, rgba(17,14,32,0.96), rgba(11,8,23,0.98))', backdropFilter: 'blur(16px)', WebkitBackdropFilter: 'blur(16px)', border: '1px solid rgba(139,92,246,0.35)', borderRadius: 12, padding: '16px 20px', boxShadow: '0 -10px 60px rgba(139,92,246,0.18)', display: 'flex', flexDirection: 'column', zIndex: 31, overflow: 'hidden' }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12, paddingBottom: 10, borderBottom: '1px solid rgba(139,92,246,0.2)' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <div style={{ width: 28, height: 28, borderRadius: 6, background: 'linear-gradient(135deg, rgba(139,92,246,0.2), rgba(167,139,250,0.2))', border: '1px solid rgba(139,92,246,0.4)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}><Microscope size={14} style={{ color: '#a78bfa' }} /></div>
+                  <div>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: '#a78bfa' }}>Node Deep-Dive</div>
+                    <div style={{ fontSize: 9, color: 'var(--t3)', marginTop: 1 }}>{isNodeNarrating ? `Analyzing ${selectedNode?.data.label ?? 'node'}...` : `${selectedNode?.data.label ?? 'node'} · complete`}</div>
+                  </div>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <button onClick={toggleNodeNarratorSpeech} style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 9.5, padding: '4px 9px', borderRadius: 5, border: `1px solid ${nodeNarratorSpeechOn ? 'rgba(139,92,246,0.4)' : 'var(--ln2)'}`, background: nodeNarratorSpeechOn ? 'rgba(139,92,246,0.12)' : 'transparent', color: nodeNarratorSpeechOn ? '#a78bfa' : 'var(--t3)', cursor: 'pointer', fontWeight: 600, fontFamily: 'var(--mono)' }}>
+                    {nodeNarratorSpeechOn ? <Volume2 size={11} /> : <VolumeX size={11} />}{nodeNarratorSpeechOn ? 'Voice On' : 'Voice Off'}
+                  </button>
+                  <button onClick={() => { setShowNodeNarrator(false); stopNodeNarratorSpeech(); }} style={{ background: 'none', border: 'none', color: 'var(--t3)', cursor: 'pointer', padding: 4, borderRadius: 4, lineHeight: 0 }} onMouseEnter={e => (e.currentTarget.style.color = '#a78bfa')} onMouseLeave={e => (e.currentTarget.style.color = 'var(--t3)')}>
+                    <X size={16} />
+                  </button>
+                </div>
+              </div>
+              <div className="ez-s" style={{ flex: 1, overflowY: 'auto', fontSize: 11.5, lineHeight: 1.8, color: 'var(--t2)', paddingRight: 8 }}>
+                {nodeNarration ? <ReactMarkdown>{nodeNarration}</ReactMarkdown> : (
+                  <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--t3)', fontStyle: 'italic' }}>
+                    {isNodeNarrating ? <div style={{ textAlign: 'center' }}><Activity size={20} className="ez-spin" style={{ color: '#a78bfa', marginBottom: 10 }} /><div>Analyzing node...</div></div> : 'Click "Explain This Node" in the detail panel'}
+                  </div>
+                )}
+              </div>
+              {nodeNarration && !isNodeNarrating && (
+                <div style={{ marginTop: 12, paddingTop: 10, borderTop: '1px solid rgba(139,92,246,0.2)', display: 'flex', justifyContent: 'flex-end' }}>
+                  <button onClick={() => { setNodeNarration(''); startNodeNarration(); }} style={{ fontSize: 10, padding: '5px 12px', borderRadius: 6, border: '1px solid rgba(139,92,246,0.3)', background: 'rgba(139,92,246,0.1)', color: '#a78bfa', cursor: 'pointer', fontWeight: 600, fontFamily: 'var(--mono)' }} onMouseEnter={e => (e.currentTarget.style.background = 'rgba(139,92,246,0.2)')} onMouseLeave={e => (e.currentTarget.style.background = 'rgba(139,92,246,0.1)')}>🔄 Re-analyze</button>
+                </div>
+              )}
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+      </div>
+    </FocusCtx.Provider>
+  );
+}
+
+function CustomZoomControls() {
+  const { zoomIn, zoomOut, zoomTo } = useReactFlow();
+  const { zoom } = useViewport();
+  return (
+    <Panel position="bottom-right" style={{ marginBottom: 20, marginRight: 20 }}>
+      <div style={{ background: 'rgba(11,16,23,.88)', backdropFilter: 'blur(8px)', border: '1px solid var(--ln2)', borderRadius: 8, padding: '6px 12px', display: 'flex', alignItems: 'center', gap: 10, boxShadow: '0 8px 32px rgba(0,0,0,.6)' }}>
+        <button onClick={() => zoomOut({ duration: 200 })} style={{ background: 'transparent', border: 'none', color: 'var(--t2)', cursor: 'pointer', fontSize: 16, lineHeight: 1 }}>-</button>
+        <input type="range" min={0.03} max={4} step={0.01} value={zoom} onChange={e => zoomTo(parseFloat(e.target.value), { duration: 150 })} className="ez-zoom-slider" />
+        <button onClick={() => zoomIn({ duration: 200 })} style={{ background: 'transparent', border: 'none', color: 'var(--t2)', cursor: 'pointer', fontSize: 16, lineHeight: 1 }}>+</button>
+      </div>
+    </Panel>
+  );
+}
+
+export default function EzDocsIDE() {
+  return (
+    <ReactFlowProvider>
+      <EzDocsInner />
+    </ReactFlowProvider>
+  );
+}

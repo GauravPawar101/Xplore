@@ -1,0 +1,46 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+venv/
+.venv/
+env/
+.env
+!.env.example
+
+# Build & cache
+dist/
+build/
+out/
+.next/
+*.pyc
+__pycache__/
+.parcel-cache/
+.vite/
+*.tsbuildinfo
+tsc_out.txt
+tsc_errors.txt
+
+# IDE & OS
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs & temp
+*.log
+npm-debug.log*
+.tmp
+temp/
+tmp/
+*.tmp
+tmpclaude-*
+# Ingested / runtime data (re-generated on demand)
+backend/ingested_codebases/
+
+# Env (keep example only)
+.env.local
+.env.*.local
+
+*.bat

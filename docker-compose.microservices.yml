@@ -1,0 +1,79 @@
+# EzDocs microservices stack
+# Run: docker compose -f docker-compose.yml -f docker-compose.microservices.yml up -d
+# (starts Postgres, Mongo, Milvus from docker-compose.yml plus gateway + 3 services)
+
+services:
+  graph:
+    build: ./backend
+    container_name: ezdocs-graph
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    environment:
+      EZDOCS_HOST: "0.0.0.0"
+      EZDOCS_PORT: "8001"
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/ezdocs
+      MONGODB_URI: mongodb://mongo:27017
+      MILVUS_URI: http://milvus:19530
+    command: uvicorn graph.app:app --host 0.0.0.0 --port 8001
+    depends_on:
+      - postgres
+
+  rag:
+    build: ./backend
+    container_name: ezdocs-rag
+    restart: unless-stopped
+    ports:
+      - "8003:8003"
+    environment:
+      EZDOCS_HOST: "0.0.0.0"
+      EZDOCS_PORT: "8003"
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/ezdocs
+      MONGODB_URI: mongodb://mongo:27017
+      MILVUS_URI: http://milvus:19530
+    command: uvicorn rag.app:app --host 0.0.0.0 --port 8003
+    depends_on:
+      - postgres
+      - milvus
+
+  program:
+    build: ./backend
+    container_name: ezdocs-program
+    restart: unless-stopped
+    ports:
+      - "8004:8004"
+    environment:
+      EZDOCS_HOST: "0.0.0.0"
+      EZDOCS_PORT: "8004"
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/ezdocs
+      MONGODB_URI: mongodb://mongo:27017
+      MILVUS_URI: http://milvus:19530
+    command: uvicorn program.app:app --host 0.0.0.0 --port 8004
+    depends_on:
+      - postgres
+      - mongo
+
+  gateway:
+    build: ./backend
+    container_name: ezdocs-gateway
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      EZDOCS_HOST: "0.0.0.0"
+      EZDOCS_PORT: "8000"
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/ezdocs
+      MONGODB_URI: mongodb://mongo:27017
+      MILVUS_URI: http://milvus:19530
+      OLLAMA_HOST: http://ollama:11434
+      EZDOCS_GRAPH_SVC_URL: http://graph:8001
+      EZDOCS_RAG_SVC_URL: http://rag:8003
+      EZDOCS_PROGRAM_SVC_URL: http://program:8004
+    command: python gateway.py
+    depends_on:
+      - graph
+      - rag
+      - program
+      - ollama
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

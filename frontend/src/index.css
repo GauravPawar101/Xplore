@@ -1,0 +1,17 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* App uses CodeMap.css for theme; keep body minimal so dark theme from CodeMap wins */
+body {
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Lightweight viewport transition for pan/zoom */
+.react-flow__viewport {
+  transition: transform 0.12s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.react-flow__edge-path {
+  transition: stroke-opacity 0.2s ease, stroke-width 0.2s ease;
+}
