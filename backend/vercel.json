@@ -1,0 +1,23 @@
+{
+  "version": 2,
+
+  "functions": {
+    "api/graph.py":   { "maxDuration": 300 },
+    "api/rag.py":     { "maxDuration": 60  },
+    "api/program.py": { "maxDuration": 300 },
+    "api/gateway.py": { "maxDuration": 60  }
+  },
+
+  "routes": [
+    { "src": "/analyze(.*)",  "dest": "api/graph.py"   },
+    { "src": "/files(.*)",    "dest": "api/graph.py"   },
+    { "src": "/graph(.*)",    "dest": "api/graph.py"   },
+    { "src": "/analyses(.*)", "dest": "api/graph.py"   },
+    { "src": "/jobs(.*)",     "dest": "api/graph.py"   },
+    { "src": "/rag(.*)",      "dest": "api/rag.py"     },
+    { "src": "/program(.*)",  "dest": "api/program.py" },
+    { "src": "/generate(.*)", "dest": "api/program.py" },
+    { "src": "/generated(.*)", "dest": "api/program.py"},
+    { "src": "/(.*)",         "dest": "api/gateway.py" }
+  ]
+}

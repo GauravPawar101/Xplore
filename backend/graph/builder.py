@@ -130,6 +130,85 @@ def tokenise(code: str, filepath: str) -> set[str]:
     return {t for t in fn(code) if len(t) >= MIN_NAME_LEN and t not in _COMMON_TOKENS}
 
 
+# ─── Local-import helpers ─────────────────────────────────────────────────────
+
+def _extract_local_import_paths(code: str, filepath: str) -> list[str]:
+    """Extract relative (local) import path strings from source code.
+
+    Only returns paths that start with ``'.'`` – these reference files within
+    the project rather than third-party packages or the standard library.
+
+    * JS/TS  – ``import X from './path'``  /  ``require('./path')``
+    * Python – ``from .module import X``   /  ``from ..pkg import Y``
+    """
+    ext = Path(filepath).suffix.lower()
+    paths: list[str] = []
+    if ext in (".js", ".ts", ".tsx", ".jsx"):
+        # ES module syntax
+        paths += re.findall(r'from\s+[\'"](\.[^\'"\s]+)[\'"]', code)
+        # CommonJS
+        paths += re.findall(r'require\s*\(\s*[\'"](\.[^\'"\s]+)[\'"]', code)
+    elif ext == ".py":
+        paths += [
+            p
+            for p in re.findall(r"from\s+(\.+\w*)\s+import", code, re.MULTILINE)
+            if p.startswith(".")
+        ]
+    return paths
+
+
+def _resolve_local_import(
+    import_path: str,
+    source_file: str,
+    all_filepaths: frozenset[str],
+) -> str | None:
+    """Resolve a relative import path to an actual file path within the project.
+
+    Handles multi-level ``..`` traversal correctly so that, for example,
+    ``'../../models/user'`` imported from ``'src/api/index.js'`` resolves to
+    ``'models/user.js'`` when that file exists in *all_filepaths*.
+
+    Returns the normalised relative path string if a matching file exists,
+    otherwise ``None``.
+    """
+    source_dir = str(Path(source_file).parent)
+    # os.path.normpath resolves all '..' components correctly without requiring
+    # an absolute path, giving us a clean relative path like 'models/user'.
+    base = os.path.normpath(os.path.join(source_dir, import_path)).replace("\\", "/")
+    # Strip leading './' if present (root-level files sit under '.')
+    if base.startswith("./"):
+        base = base[2:]
+    ext = Path(source_file).suffix.lower()
+
+    if ext in (".js", ".ts", ".tsx", ".jsx"):
+        for cext in (".js", ".jsx", ".ts", ".tsx"):
+            if f"{base}{cext}" in all_filepaths:
+                return f"{base}{cext}"
+            if f"{base}/index{cext}" in all_filepaths:
+                return f"{base}/index{cext}"
+    elif ext == ".py":
+        # Use normpath for Python too, counting the number of leading dots to
+        # determine how many directory levels to ascend.
+        dot_count = len(import_path) - len(import_path.lstrip("."))
+        parent = source_dir
+        for _ in range(dot_count - 1):
+            parent = str(Path(parent).parent)
+        module = import_path.lstrip(".").replace(".", "/")
+        # 'from . import x' has an empty module part – we cannot resolve the
+        # target without parsing the import clause, so skip gracefully.
+        if module:
+            mod_base = os.path.normpath(os.path.join(parent, module)).replace("\\", "/")
+            if mod_base.startswith("./"):
+                mod_base = mod_base[2:]
+            for candidate in (
+                f"{mod_base}.py",
+                f"{mod_base}/__init__.py",
+            ):
+                if candidate in all_filepaths:
+                    return candidate
+    return None
+
+
 def _parse_one_file(root_path: Path, file_path: Path) -> tuple[str, list[dict[str, Any]]]:
     """Parse one file in isolation (for parallel workers). Returns (relative_path_str, list of ParseResult)."""
     try:
@@ -281,6 +360,58 @@ class GraphBuilder:
             if len(code) > max_len:
                 self.graph.nodes[_nid]["code"] = code[:max_len]
 
+    def _classify_node_layers(self) -> dict[str, int]:
+        """Classify each unique filepath in the graph into a display layer.
+
+        * **Layer 0** – root-level files: files whose relative path contains no
+          directory separator (i.e. they live directly in the repository root).
+        * **Layer 1** – files directly imported by layer-0 files via local /
+          relative import statements (not third-party packages).
+        * **Layer 2** – everything else.
+
+        Returns a ``{filepath: layer}`` mapping.
+        """
+        all_filepaths: frozenset[str] = frozenset(
+            data["filepath"]
+            for _, data in self.graph.nodes(data=True)
+            if data.get("filepath")
+        )
+
+        # Root-level files have no directory separator in their relative path
+        root_files: set[str] = {
+            fp for fp in all_filepaths
+            if "/" not in fp and "\\" not in fp
+        }
+
+        # Discover local dependencies of root files by reading their source
+        root_deps: set[str] = set()
+        for fp in root_files:
+            try:
+                code = (self.root_path / fp).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for imp_path in _extract_local_import_paths(code, fp):
+                resolved = _resolve_local_import(imp_path, fp, all_filepaths)
+                if resolved and resolved not in root_files:
+                    root_deps.add(resolved)
+
+        layer_map: dict[str, int] = {}
+        for fp in all_filepaths:
+            if fp in root_files:
+                layer_map[fp] = 0
+            elif fp in root_deps:
+                layer_map[fp] = 1
+            else:
+                layer_map[fp] = 2
+
+        log.info(
+            "Layer classification — root: %d, direct-deps: %d, other: %d",
+            len(root_files),
+            len(root_deps),
+            len(all_filepaths) - len(root_files) - len(root_deps),
+        )
+        return layer_map
+
     # ── Public API ─────────────────────────────────────────────────────────
 
     def build_graph(self, max_files: int = 200) -> nx.DiGraph:
@@ -331,16 +462,29 @@ class GraphBuilder:
         """
         Serialise the graph for React Flow.
 
-        Entry-point nodes (main, index, app, …) are positioned at y=0;
-        everything else is laid out in a grid below them. The frontend
-        Dagre layout will override these positions — they're just sensible
-        fallbacks so an un-laid-out graph still looks reasonable.
+        Nodes are ordered and positioned in three layers:
+
+        * **Layer 0** – root-level files (files directly in the repo root).
+          Displayed in a horizontal row at y=0.
+        * **Layer 1** – files directly imported by root files via local imports
+          (not third-party packages). Displayed in a grid below layer 0.
+        * **Layer 2+** – everything else. Displayed in a grid below layer 1.
+
+        When there are no root-level files the layout falls back to the
+        original keyword-based entry-point detection (main, index, app, …).
+
+        The frontend Dagre layout will override these positions – they are just
+        sensible fallbacks so an un-laid-out graph still looks reasonable.
 
         Returns:
             ``{"nodes": [...], "edges": [...]}``
         """
-        entry_nodes:   list[dict] = []
-        regular_nodes: list[dict] = []
+        layer_map = self._classify_node_layers()
+        has_root_files = any(lyr == 0 for lyr in layer_map.values())
+
+        root_nodes:    list[dict] = []   # layer 0 – files in the repo root
+        dep1_nodes:    list[dict] = []   # layer 1 – direct local deps of root files
+        regular_nodes: list[dict] = []   # layer 2+ – everything else
 
         for node_id, data in self.graph.nodes(data=True):
             # Guard against nodes with missing required fields
@@ -355,29 +499,60 @@ class GraphBuilder:
             except ImportError:
                 code_display = code_full
 
+            layer        = layer_map.get(filepath, 2)
+            is_root_file = layer == 0
+            is_root_dep  = layer == 1
+
+            name_lower = name.lower()
+            file_lower = filepath.lower()
+            # Root-level files are always treated as entry points; keyword
+            # matching is kept as a fallback for repos where code lives only
+            # inside subdirectories.
+            is_entry = is_root_file or any(
+                kw in name_lower or kw in file_lower for kw in ENTRY_POINT_NAMES
+            )
+
             rf_node = {
                 "id":   node_id,
                 "type": "default",
                 "data": {
-                    "label":      name,
-                    "type":       ntype,
-                    "filepath":   filepath,
-                    "start_line": data.get("start_line", 0),
-                    "end_line":   data.get("end_line", 0),
-                    "code":       code_display,
+                    "label":        name,
+                    "type":         ntype,
+                    "filepath":     filepath,
+                    "start_line":   data.get("start_line", 0),
+                    "end_line":     data.get("end_line", 0),
+                    "code":         code_display,
+                    "is_root_file": is_root_file,
+                    "is_root_dep":  is_root_dep,
+                    "layer":        layer,
                 },
                 "position": {"x": 0, "y": 0},
             }
 
-            name_lower = name.lower()
-            file_lower = filepath.lower()
-            is_entry   = any(kw in name_lower or kw in file_lower for kw in ENTRY_POINT_NAMES)
-
-            (entry_nodes if is_entry else regular_nodes).append(rf_node)
+            if is_root_file:
+                root_nodes.append(rf_node)
+            elif is_root_dep:
+                dep1_nodes.append(rf_node)
+            elif not has_root_files and is_entry:
+                # Keyword-based fallback: no root files detected, so use the
+                # conventional entry-point heuristic.
+                root_nodes.append(rf_node)
+            else:
+                regular_nodes.append(rf_node)
 
         # ── Fallback positions (overridden by frontend Dagre) ──────────────
-        _place_entry_row(entry_nodes, spacing=220)
-        _place_grid(regular_nodes, offset_y=220 if entry_nodes else 0, col_spacing=190, row_spacing=130)
+        _place_entry_row(root_nodes, spacing=220)
+
+        dep1_y = 220 if root_nodes else 0
+        _place_grid(dep1_nodes, offset_y=dep1_y, col_spacing=190, row_spacing=130)
+
+        if dep1_nodes:
+            dep1_cols = max(5, min(15, int(len(dep1_nodes) ** 0.5)))
+            dep1_rows = (len(dep1_nodes) + dep1_cols - 1) // dep1_cols
+            regular_y = dep1_y + dep1_rows * 130 + 100
+        else:
+            regular_y = dep1_y + (220 if root_nodes else 0)
+        _place_grid(regular_nodes, offset_y=regular_y, col_spacing=190, row_spacing=130)
 
         # ── Edges ──────────────────────────────────────────────────────────
         rf_edges: list[dict] = []
@@ -392,7 +567,7 @@ class GraphBuilder:
                 "style":    {"strokeWidth": 2, "strokeOpacity": 0.7},
             })
 
-        return {"nodes": entry_nodes + regular_nodes, "edges": rf_edges}
+        return {"nodes": root_nodes + dep1_nodes + regular_nodes, "edges": rf_edges}
 
 
 # ─── Layout helpers (pure functions) ─────────────────────────────────────────

@@ -30,7 +30,12 @@ export const FileGroupNode = memo(function FileGroupNode({ data }: NodeProps) {
                     {langLabel}
                 </span>
                 {data.isEntry && (
-                    <span style={{ fontSize: 7.5, padding: '1px 5px', borderRadius: 99, background: 'rgba(20,184,166,.15)', border: '1px solid rgba(20,184,166,.3)', color: 'var(--tl)', flexShrink: 0 }}>ENTRY</span>
+                    <span style={{ fontSize: 7.5, padding: '1px 5px', borderRadius: 99, background: 'rgba(20,184,166,.15)', border: '1px solid rgba(20,184,166,.3)', color: 'var(--tl)', flexShrink: 0 }}>
+                        {data.is_root_file ? 'ROOT' : 'ENTRY'}
+                    </span>
+                )}
+                {!data.isEntry && data.is_root_dep && (
+                    <span style={{ fontSize: 7.5, padding: '1px 5px', borderRadius: 99, background: 'rgba(245,158,11,.12)', border: '1px solid rgba(245,158,11,.3)', color: 'var(--am)', flexShrink: 0 }}>ROOT DEP</span>
                 )}
             </div>
 

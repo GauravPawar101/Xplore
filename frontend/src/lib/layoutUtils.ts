@@ -84,7 +84,10 @@ export function treeLayout(
         }
     }
 
+    // Prefer nodes from root-level files (is_root_file flag) as the entry node;
+    // fall back to keyword-based detection for repos where all code is in subdirectories.
     const entry =
+        rawNodes.find((n) => Boolean(n.data.is_root_file)) ??
         rawNodes.find((n) => {
             const lb = (n.data.label ?? '').toLowerCase();
             const fp = (n.data.filepath ?? '').toLowerCase();
@@ -98,9 +101,16 @@ export function treeLayout(
 
     const entryFile = nodeToFile.get(entry.id) ?? 'unknown';
 
-    const fileDepth = new Map<string, number>([[entryFile, 0]]);
-    const bfsQ = [entryFile];
-    const bfsSeen = new Set([entryFile]);
+    // Seed BFS from all root-level files so they all get depth 0.
+    const rootFileSet = new Set(
+        rawNodes
+            .filter((n) => Boolean(n.data.is_root_file))
+            .map((n) => (n.data.filepath as string) ?? 'unknown')
+    );
+    const seedFilesTree = rootFileSet.size > 0 ? [...rootFileSet] : [entryFile];
+    const fileDepth = new Map<string, number>(seedFilesTree.map((fp) => [fp, 0]));
+    const bfsQ = [...seedFilesTree];
+    const bfsSeen = new Set(seedFilesTree);
     while (bfsQ.length) {
         const cur = bfsQ.shift()!;
         for (const next of fileAdj.get(cur) ?? new Set()) {
@@ -231,7 +241,7 @@ export function treeLayout(
             bounds,
             depth,
             color: getClusterColor(filepath, depth),
-            isEntry: filepath === entryFile,
+            isEntry: rootFileSet.size > 0 ? rootFileSet.has(filepath) : filepath === entryFile,
             nodeCount: fileGroups.get(filepath)?.length ?? 0,
         };
     });
@@ -268,15 +278,29 @@ export function architectLayout(
     }
 
     const filePaths = [...groups.keys()];
-    const entryFile =
-        filePaths.find((fp) => {
-            const base = fp.replace(/\\/g, '/').split('/').pop()?.split('.')[0]?.toLowerCase() ?? '';
-            return ENTRY_KW.has(base);
-        }) ?? filePaths[0];
 
-    const fileDepth = new Map<string, number>([[entryFile, 0]]);
-    const bfsQ = [entryFile];
-    const bfsSeen = new Set([entryFile]);
+    // Root-level files: use is_root_file from node data when available, otherwise
+    // detect by the absence of a directory separator in the relative path.
+    // The path-separator fallback handles cached graphs that pre-date the is_root_file field.
+    const rootFilePaths = filePaths.filter((fp) =>
+        groups.get(fp)?.some((n) => Boolean(n.data.is_root_file))
+            ?? (!fp.includes('/') && !fp.includes('\\'))
+    );
+
+    // Seed files for BFS at depth 0: all root files, or fall back to keyword-matched entry
+    const seedFiles =
+        rootFilePaths.length > 0
+            ? rootFilePaths
+            : filePaths.filter((fp) => {
+                  const base = fp.replace(/\\/g, '/').split('/').pop()?.split('.')[0]?.toLowerCase() ?? '';
+                  return ENTRY_KW.has(base);
+              });
+
+    const entryFile = seedFiles[0] ?? filePaths[0];
+
+    const fileDepth = new Map<string, number>(seedFiles.map((fp) => [fp, 0]));
+    const bfsQ = seedFiles.length > 0 ? [...seedFiles] : [entryFile];
+    const bfsSeen = new Set(bfsQ);
     while (bfsQ.length) {
         const cur = bfsQ.shift()!;
         for (const next of fileAdj.get(cur) ?? new Set()) {
@@ -313,6 +337,8 @@ export function architectLayout(
         const filename = fp.replace(/\\/g, '/').split('/').pop() ?? fp;
         const depth = fileDepth.get(fp) ?? maxD + 1;
         const { label: langLabel, color: langColor } = langInfo(filename);
+        const isRootFile = members.some((n) => Boolean(n.data.is_root_file));
+        const isRootDep  = !isRootFile && members.some((n) => Boolean(n.data.is_root_dep));
         rfNodes.push({
             id: `file::${fp}`,
             type: 'fileGroup',
@@ -322,7 +348,9 @@ export function architectLayout(
                 label: filename,
                 langLabel,
                 langColor,
-                isEntry: fp === entryFile,
+                isEntry: seedFiles.includes(fp),
+                is_root_file: isRootFile,
+                is_root_dep: isRootDep,
                 depth,
                 isFocused: false,
                 isCalled: false,

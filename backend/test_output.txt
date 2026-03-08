@@ -1,0 +1,11 @@
+Found 3 entry nodes.
+Traceback (most recent call last):
+Node: main.py::start, Score: 160
+Node: index.js::log, Score: 50
+Node: utils.py::run, Score: 10
+  File "C:\Users\Gaurav\Desktop\EzDocs\backend\tests\test_entrypoint.py", line 57, in <module>
+    test_entrypoint_scoring()
+  File "C:\Users\Gaurav\Desktop\EzDocs\backend\tests\test_entrypoint.py", line 42, in test_entrypoint_scoring
+    assert entry_nodes[0]["data"]["entry_score"] == 150  # main.py with convention
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError

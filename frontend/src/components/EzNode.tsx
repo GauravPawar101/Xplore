@@ -51,13 +51,29 @@ export const EzNode = memo(function EzNode({ id, data }: NodeProps) {
                 }}>
                     {data.type}
                 </span>
-                {data.isEntry && !hasFocus && (
-                    <span style={{
-                        marginLeft: 'auto', fontSize: 7.5, padding: '1px 5px', borderRadius: 99,
-                        background: 'rgba(20,184,166,.15)', border: '1px solid rgba(20,184,166,.3)', color: 'var(--tl)'
-                    }}>
-                        ENTRY
-                    </span>
+                {!hasFocus && (
+                    data.is_root_file ? (
+                        <span style={{
+                            marginLeft: 'auto', fontSize: 7.5, padding: '1px 5px', borderRadius: 99,
+                            background: 'rgba(20,184,166,.15)', border: '1px solid rgba(20,184,166,.3)', color: 'var(--tl)'
+                        }}>
+                            ROOT
+                        </span>
+                    ) : data.isEntry ? (
+                        <span style={{
+                            marginLeft: 'auto', fontSize: 7.5, padding: '1px 5px', borderRadius: 99,
+                            background: 'rgba(20,184,166,.15)', border: '1px solid rgba(20,184,166,.3)', color: 'var(--tl)'
+                        }}>
+                            ENTRY
+                        </span>
+                    ) : data.is_root_dep ? (
+                        <span style={{
+                            marginLeft: 'auto', fontSize: 7.5, padding: '1px 5px', borderRadius: 99,
+                            background: 'rgba(245,158,11,.12)', border: '1px solid rgba(245,158,11,.3)', color: 'var(--am)'
+                        }}>
+                            ROOT DEP
+                        </span>
+                    ) : null
                 )}
                 {isFocused && (
                     <span style={{
