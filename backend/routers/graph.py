@@ -26,7 +26,7 @@ IGNORED_DIRS = {
     "venv", ".venv", "env", ".env",
     "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache",
     "dist", "build", "out", "target",
-    "site-packages", "dist-packages", "lib", "Lib",
+    "site-packages", "dist-packages",
 }
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────

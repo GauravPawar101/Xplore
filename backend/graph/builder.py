@@ -29,7 +29,7 @@ IGNORED_DIRS: frozenset[str] = frozenset({
     "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache",
     "dist", "build", "out", "target",
     # pip install locations — prevent analysing installed packages
-    "site-packages", "dist-packages", "lib", "Lib",
+    "site-packages", "dist-packages",
 })
 
 ENTRY_POINT_NAMES: frozenset[str] = frozenset({
@@ -248,7 +248,12 @@ class GraphBuilder:
         return any(part in IGNORED_DIRS for part in path.parts)
 
     def _collect_files(self, max_files: int) -> list[Path]:
-        files: list[Path] = []
+        # Collect root-level files and subdir files separately so that
+        # root (global) files are always processed first regardless of
+        # directory walk order.
+        root_files: list[Path] = []
+        subdir_files: list[Path] = []
+
         for root, dirs, filenames in os.walk(self.root_path):
             root_p = Path(root)
             if self._is_ignored(root_p):
@@ -256,16 +261,26 @@ class GraphBuilder:
                 continue
 
             # Prune ignored subdirs in-place so os.walk skips them
-            dirs[:] = [d for d in dirs if d not in IGNORED_DIRS and not d.startswith(".")]
+            dirs[:] = sorted([
+                d for d in dirs
+                if d not in IGNORED_DIRS and not d.startswith(".")
+            ])
 
+            is_root_level = root_p == self.root_path
             for name in filenames:
                 fp = root_p / name
                 if self.parser.is_supported(str(fp)):
-                    files.append(fp)
-                    if len(files) >= max_files:
-                        log.warning("File limit reached (%d). Truncating.", max_files)
-                        return files
-        return files
+                    if is_root_level:
+                        root_files.append(fp)
+                    else:
+                        subdir_files.append(fp)
+
+        # Root-level (global) files first, then subdirectory files.
+        combined = root_files + subdir_files
+        if len(combined) > max_files:
+            log.warning("File limit reached (%d). Truncating.", max_files)
+            combined = combined[:max_files]
+        return combined
 
     def _process_file(self, file_path: Path) -> int:
         """Parse one file, add its nodes to the graph. Returns node count added."""
