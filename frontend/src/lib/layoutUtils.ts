@@ -334,9 +334,10 @@ export function architectLayout(
     const rfNodes: Node[] = [];
     for (const [fp, members] of groups) {
         const p = filePos.get(fp)!;
-        const filename = fp.replace(/\\/g, '/').split('/').pop() ?? fp;
+        const normalizedFp = fp.replace(/\\/g, '/');
+        const basename = normalizedFp.split('/').pop() ?? normalizedFp;
         const depth = fileDepth.get(fp) ?? maxD + 1;
-        const { label: langLabel, color: langColor } = langInfo(filename);
+        const { label: langLabel, color: langColor } = langInfo(basename);
         const isRootFile = members.some((n) => Boolean(n.data.is_root_file));
         const isRootDep  = !isRootFile && members.some((n) => Boolean(n.data.is_root_dep));
         rfNodes.push({
@@ -345,7 +346,7 @@ export function architectLayout(
             position: { x: p.x, y: p.y },
             data: {
                 filepath: fp,
-                label: filename,
+                label: normalizedFp,
                 langLabel,
                 langColor,
                 isEntry: seedFiles.includes(fp),

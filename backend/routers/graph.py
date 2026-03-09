@@ -10,24 +10,13 @@ from fastapi import APIRouter, File, HTTPException, Query, UploadFile, WebSocket
 
 from shared import crawler, ingest
 from shared.config import DEFAULT_MAX_FILES, MAX_FILES_CEILING
-from graph.builder import GraphBuilder
+from graph.builder import GraphBuilder, IGNORED_DIRS
 from shared.schemas import GithubRequest
 from shared.state import graph_cache, get_parser
 
 from shared import db
 
 log = logging.getLogger("ezdocs")
-
-# ─── Constants ───────────────────────────────────────────────────────────────
-
-IGNORED_DIRS = {
-    ".git", ".hg", ".svn",
-    "node_modules",
-    "venv", ".venv", "env", ".env",
-    "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache",
-    "dist", "build", "out", "target",
-    "site-packages", "dist-packages",
-}
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
 

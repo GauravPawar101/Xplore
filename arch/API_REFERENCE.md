@@ -1,18 +1,18 @@
 # API Reference
 
-Complete HTTP and WebSocket API for Xplore.
+Complete HTTP and WebSocket API for EzDocs.
 
 ---
 
 ## Base URLs
 
-| Mode          | URL                          |
-|---------------|------------------------------|
-| Monolith      | `http://localhost:8000`      |
-| Gateway       | `http://localhost:8000`      |
-| Graph service | `http://localhost:8001`      |
-| RAG service   | `http://localhost:8003`      |
-| Program svc   | `http://localhost:8004`      |
+| Mode            | URL                          |
+|-----------------|------------------------------|
+| Monolith        | `http://localhost:8000`      |
+| Gateway         | `http://localhost:8000`      |
+| Graph service   | `http://localhost:8001`      |
+| RAG service     | `http://localhost:8003`      |
+| Program service | `http://localhost:8004`      |
 
 ---
 
@@ -24,11 +24,26 @@ Optional Clerk JWT authentication. When enabled, pass the JWT in the `Authorizat
 Authorization: Bearer <clerk-jwt-token>
 ```
 
-Most endpoints work without auth in development. Auth is required for user-scoped operations (saved analyses, program graphs, generated code listing).
+Backend verifies the token via JWKS (`CLERK_JWKS_URL`). Most endpoints work without auth in development. Auth is required for user-scoped operations (saved analyses, program graphs, generated code listing).
+
+The frontend's `AuthRequestInterceptor` automatically attaches Clerk JWTs to all axios requests.
 
 ---
 
 ## REST Endpoints
+
+### Health / Meta
+
+#### `GET /health`
+
+Health check endpoint.
+
+**Response:**
+```json
+{"status": "ok"}
+```
+
+---
 
 ### AI / Explanation
 
@@ -40,11 +55,13 @@ Generate an AI explanation for a code snippet.
 ```json
 {
   "code": "def fibonacci(n):\n    if n <= 1: return n\n    return fibonacci(n-1) + fibonacci(n-2)",
-  "language": "python"
+  "context": "optional context string",
+  "callers": ["optional", "list", "of", "caller", "names"],
+  "callees": ["optional", "list", "of", "callee", "names"]
 }
 ```
 
-**Response:** Streamed text explanation.
+**Response:** `200 OK`, streaming text explanation.
 
 ---
 
@@ -56,46 +73,49 @@ Analyze a local directory.
 
 **Query Parameters:**
 
-| Param     | Type   | Required | Description                          |
-|-----------|--------|----------|--------------------------------------|
-| `path`    | string | yes      | Absolute path to directory           |
-| `explain` | bool   | no       | Generate AI summaries (default false)|
-| `persist` | bool   | no       | Save to Postgres (default false)     |
+| Param         | Type   | Required | Default | Description                          |
+|---------------|--------|----------|---------|--------------------------------------|
+| `path`        | string | yes      |         | Absolute path to directory           |
+| `max_files`   | int    | no       | 200     | Max files to analyze (ceiling: 1000) |
+| `codebase_id` | string | no       | (auto)  | UUID for this analysis               |
+| `user_id`     | string | no       |         | Clerk user ID for persistence        |
 
 **Response:**
 ```json
 {
-  "graph": {
-    "nodes": [
-      {
-        "id": "abc123",
-        "type": "ez",
-        "data": {
-          "label": "main",
-          "symbolType": "function",
-          "filepath": "src/main.py",
-          "startLine": 1,
-          "endLine": 15,
-          "code": "def main():...",
-          "summary": "Entry point that initializes the app",
-          "entry_score": 150,
-          "isEntry": true,
-          "isLibrary": false
-        },
-        "position": {"x": 0, "y": 0}
-      }
-    ],
-    "edges": [
-      {
-        "id": "e-abc123-def456",
-        "source": "abc123",
-        "target": "def456",
-        "type": "ez",
-        "data": {"edgeType": "CALLS"}
-      }
-    ]
-  },
-  "codebase_id": "uuid-string"
+  "nodes": [
+    {
+      "id": "abc123",
+      "type": "ez",
+      "data": {
+        "label": "main",
+        "type": "function",
+        "filepath": "src/main.py",
+        "start_line": 1,
+        "end_line": 15,
+        "code": "def main():...",
+        "explanation": "Entry point that initializes the app",
+        "entry_score": 150,
+        "is_library": false
+      },
+      "position": {"x": 0, "y": 0}
+    }
+  ],
+  "edges": [
+    {
+      "id": "e-abc123-def456",
+      "source": "abc123",
+      "target": "def456",
+      "type": "ez",
+      "label": "CALLS"
+    }
+  ],
+  "reconciliation": {
+    "root_files": ["main.py"],
+    "direct_deps": {"main.py": ["config.py", "routes/index.py"]},
+    "unresolved": {"main.py": ["fastapi", "uvicorn"]},
+    "layer_map": {"main.py": 0, "config.py": 1, "models/user.py": 2}
+  }
 }
 ```
 
@@ -112,7 +132,7 @@ Analyze a GitHub repository (clone-based).
 }
 ```
 
-**Response:** Same as `GET /analyze`.
+**Response:** Same format as `GET /analyze`.
 
 ---
 
@@ -122,7 +142,7 @@ Analyze an uploaded ZIP archive.
 
 **Request:** `multipart/form-data` with `file` field (ZIP).
 
-**Response:** Same as `GET /analyze`.
+**Response:** Same format as `GET /analyze`.
 
 ---
 
@@ -155,17 +175,22 @@ Get recursive file tree for a directory.
 
 #### `GET /analyses`
 
-List saved analyses for the authenticated user.
+List saved analyses from Postgres.
+
+**Query Parameters:**
+
+| Param    | Type   | Required | Default | Description                 |
+|----------|--------|----------|---------|-----------------------------|
+| `user_id`| string | no       |         | Filter by user              |
+| `limit`  | int    | no       | 100     | Max results                 |
 
 **Response:**
 ```json
 [
   {
-    "id": "uuid",
-    "name": "my-project",
+    "codebase_id": "uuid",
     "source_path": "https://github.com/owner/repo",
-    "created_at": "2025-01-15T10:30:00Z",
-    "node_count": 42
+    "created_at": "2025-01-15T10:30:00+00:00"
   }
 ]
 ```
@@ -182,27 +207,7 @@ Load a persisted graph from Postgres.
 |---------------|--------|----------|-----------------------|
 | `codebase_id` | string | yes      | Analysis UUID         |
 
-**Response:** Same graph format as `GET /analyze`.
-
----
-
-#### `GET /graph/code`
-
-Fetch source code for a single node (lazy loading).
-
-**Query Parameters:**
-
-| Param         | Type   | Required | Description           |
-|---------------|--------|----------|-----------------------|
-| `codebase_id` | string | yes      | Analysis UUID         |
-| `node_id`     | string | yes      | Graph node ID         |
-
-**Response:**
-```json
-{
-  "code": "def fibonacci(n):\n    ..."
-}
-```
+**Response:** Same node/edge format as `GET /analyze` (without reconciliation).
 
 ---
 
@@ -210,35 +215,37 @@ Fetch source code for a single node (lazy loading).
 
 #### `POST /rag/query`
 
-Hybrid keyword + vector search over a codebase.
+Keyword + optional vector search over a codebase.
 
 **Request:**
 ```json
 {
   "codebase_id": "uuid",
   "query": "how does authentication work",
-  "top_k": 5,
-  "session_id": "optional-session-uuid"
+  "k": 10,
+  "program_id": "optional-program-uuid",
+  "use_vector": false
 }
 ```
 
 **Response:**
 ```json
 {
-  "results": [
+  "chunks": [
     {
-      "chunk_id": "node-uuid",
+      "id": "node-uuid",
+      "type": "symbol",
       "name": "verify_token",
       "filepath": "src/auth.py",
+      "summary": "Verifies JWT token...",
       "code": "def verify_token(token):...",
-      "score": 0.85
+      "content": null
     }
-  ],
-  "answer": "Authentication is handled by..."
+  ]
 }
 ```
 
-The `answer` field is populated when `session_id` is provided, using the conversational chat chain.
+When `program_id` is provided, program graph nodes are also searched if keyword results are below `k`.
 
 ---
 
@@ -246,12 +253,11 @@ The `answer` field is populated when `session_id` is provided, using the convers
 
 Generate embeddings for all graph nodes and store in Milvus.
 
-**Request:**
-```json
-{
-  "codebase_id": "uuid"
-}
-```
+**Query Parameters:**
+
+| Param         | Type   | Required | Description           |
+|---------------|--------|----------|-----------------------|
+| `codebase_id` | string | yes      | Analysis UUID         |
 
 **Response:**
 ```json
@@ -273,24 +279,18 @@ Create or replace a program intent graph.
 **Request:**
 ```json
 {
-  "name": "My App",
+  "program_id": "uuid",
   "nodes": [
-    {"id": "1", "label": "User Auth", "description": "JWT login/signup"}
+    {"id": "1", "content": "JWT-based login/signup", "label": "User Auth", "order": 0}
   ],
   "edges": [
-    {"source": "2", "target": "1"}
-  ]
+    {"source_id": "2", "target_id": "1"}
+  ],
+  "user_id": "clerk-user-id"
 }
 ```
 
-**Response:**
-```json
-{
-  "id": "uuid",
-  "name": "My App",
-  "created_at": "2025-01-15T10:30:00Z"
-}
-```
+**Response:** `200 OK` with `{"ok": true}` or similar confirmation.
 
 ---
 
@@ -300,11 +300,21 @@ Read a program graph.
 
 **Query Parameters:**
 
-| Param  | Type   | Required | Description    |
-|--------|--------|----------|----------------|
-| `id`   | string | yes      | Program UUID   |
+| Param        | Type   | Required | Description         |
+|--------------|--------|----------|---------------------|
+| `program_id` | string | yes      | Program UUID        |
 
-**Response:** Full program graph JSON.
+**Response:**
+```json
+{
+  "nodes": [
+    {"id": "1", "content": "...", "label": "User Auth", "summary": "...", "order": 0}
+  ],
+  "edges": [
+    {"source_id": "2", "target_id": "1"}
+  ]
+}
+```
 
 ---
 
@@ -312,12 +322,20 @@ Read a program graph.
 
 List programs for the authenticated user.
 
+**Query Parameters:**
+
+| Param   | Type | Required | Default | Description |
+|---------|------|----------|---------|-------------|
+| `limit` | int  | no       | 100     | Max results |
+
 **Response:**
 ```json
 [
-  {"id": "uuid", "name": "My App", "created_at": "...", "updated_at": "..."}
+  {"program_id": "uuid", "name": "My App", "created_at": "2025-01-15T10:30:00"}
 ]
 ```
+
+Requires authentication (Clerk JWT).
 
 ---
 
@@ -328,22 +346,14 @@ Generate LLM summaries for program nodes.
 **Request:**
 ```json
 {
-  "nodes": [
-    {"id": "1", "label": "User Auth", "description": "JWT login/signup"}
-  ],
+  "program_id": "uuid",
   "provider": "openai",
+  "model": "gpt-4o-mini",
   "api_keys": {"openai": "sk-..."}
 }
 ```
 
-**Response:**
-```json
-{
-  "nodes": [
-    {"id": "1", "label": "User Auth", "summary": "Handles JWT-based authentication..."}
-  ]
-}
-```
+**Response:** Updated program graph with `summary` fields populated on each node.
 
 ---
 
@@ -354,12 +364,14 @@ Generate code from a program graph.
 **Request:**
 ```json
 {
-  "program_nodes": [...],
-  "program_edges": [...],
+  "program_id": "uuid",
   "codebase_id": "optional-uuid",
+  "target_language": "python",
+  "stack": "FastAPI + PostgreSQL",
   "provider": "openai",
   "model": "gpt-4o-mini",
-  "api_keys": {"openai": "sk-..."}
+  "api_keys": {"openai": "sk-..."},
+  "user_id": "clerk-user-id"
 }
 ```
 
@@ -378,7 +390,7 @@ Generate code from a program graph.
 
 #### `GET /generated/{generation_id}`
 
-Retrieve generated code by ID.
+Retrieve generated code by ID from MongoDB.
 
 **Response:**
 ```json
@@ -386,7 +398,7 @@ Retrieve generated code by ID.
   "generation_id": "uuid",
   "program_id": "uuid",
   "artifacts": {"src/main.py": "..."},
-  "created_at": "..."
+  "created_at": "2025-01-15T10:30:00"
 }
 ```
 
@@ -394,7 +406,14 @@ Retrieve generated code by ID.
 
 #### `GET /generated`
 
-List generated code entries for the authenticated user.
+List generated code entries for a user.
+
+**Query Parameters:**
+
+| Param     | Type   | Required | Default | Description        |
+|-----------|--------|----------|---------|--------------------|
+| `user_id` | string | no       |         | Filter by user     |
+| `limit`   | int    | no       | 50      | Max results        |
 
 **Response:**
 ```json
@@ -414,10 +433,15 @@ Enqueue a background analysis job.
 **Request:**
 ```json
 {
+  "path": "/absolute/path/to/codebase",
   "url": "https://github.com/owner/repo",
-  "path": null
+  "max_files": 200,
+  "codebase_id": "optional-uuid",
+  "user_id": "optional-clerk-id"
 }
 ```
+
+Provide either `path` or `url`, not both.
 
 **Response:**
 ```json
@@ -440,7 +464,7 @@ Poll job status.
 }
 ```
 
-Status values: `pending`, `running`, `done`, `failed`.
+Status values: `queued`, `running`, `done`, `failed`.
 
 ---
 
@@ -497,6 +521,40 @@ Streaming GitHub analysis with real-time progress.
 
 ---
 
+### `WS /ws/explain`
+
+Streaming code explanation over WebSocket.
+
+**Client → Server:**
+```json
+{
+  "code": "def foo(): ...",
+  "context": "optional context",
+  "callers": [],
+  "callees": []
+}
+```
+
+**Server → Client:** Streaming text chunks, then connection closes.
+
+---
+
+### `WS /ws/chat`
+
+Streaming conversational chat.
+
+**Client → Server:**
+```json
+{
+  "message": "How does authentication work?",
+  "codebase_id": "optional-uuid"
+}
+```
+
+**Server → Client:** Streaming text chunks. A `\x01` byte signals end-of-stream. JSON objects with `error` field indicate errors.
+
+---
+
 ### `WS /ws/narrate`
 
 Interactive codebase tour narration.
@@ -510,13 +568,13 @@ If `codebase_id` provided, loads graph from Postgres. Otherwise uses in-memory `
 
 **Server → Client frames:**
 
-| Frame Type | Payload                                        | Description                      |
-|------------|------------------------------------------------|----------------------------------|
-| `focus`    | `{"type":"focus", "node_id":"abc", "label":"main"}` | Highlight a node on the canvas |
-| `text`     | `{"type":"text", "chunk":"This function..."}`  | Streaming narration text chunk   |
-| `pause`    | `{"type":"pause"}`                             | Waiting for user input           |
-| `done`     | `{"type":"done"}`                              | Tour completed                   |
-| `error`    | `{"type":"error", "message":"..."}`            | Error occurred                   |
+| Frame Type | Payload                                             | Description                    |
+|------------|-----------------------------------------------------|--------------------------------|
+| `focus`    | `{"type":"focus", "node_id":"abc", "label":"main"}` | Highlight a node on canvas     |
+| `text`     | `{"type":"text", "chunk":"This function..."}`       | Streaming narration text chunk |
+| `pause`    | `{"type":"pause"}`                                  | Waiting for user input         |
+| `done`     | `{"type":"done"}`                                   | Tour completed                 |
+| `error`    | `{"type":"error", "message":"..."}`                 | Error occurred                 |
 
 **Client → Server (user actions):**
 
@@ -553,7 +611,6 @@ All REST endpoints return standard HTTP error codes:
 | 400  | Bad request (validation error)             |
 | 401  | Unauthorized (missing/invalid Clerk JWT)   |
 | 404  | Resource not found                         |
-| 413  | Payload too large (ZIP > 500MB)            |
 | 422  | Unprocessable entity (Pydantic validation) |
 | 500  | Internal server error                      |
 
@@ -568,17 +625,24 @@ Error response format:
 
 ## CORS Configuration
 
-All origins allowed in development (`allow_origins=["*"]`). In production, configure via environment or middleware settings.
+Development mode allows localhost origins on ports 5173–5177. Production can use `EZDOCS_CORS_ORIGIN_REGEX` for custom domain matching or `EZDOCS_CORS_ORIGINS` (comma-separated) for additional explicit origins.
 
-Allowed methods: `GET`, `POST`, `PUT`, `DELETE`, `OPTIONS`
-Allowed headers: `*`
-Credentials: `true`
+```
+Allowed methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+Allowed headers: *
+Credentials: true
+```
+
+A custom `PreflightCORSMiddleware` handles `OPTIONS` requests explicitly for compatibility with strict browser preflight checks.
 
 ---
 
-## Middleware
+## Middleware Stack (Monolith)
 
-| Middleware    | Purpose                                 |
-|---------------|-----------------------------------------|
-| CORSMiddleware| Cross-origin request handling           |
-| GZipMiddleware| Response compression (min 500 bytes)    |
+Applied in order (bottom of stack runs first):
+
+| Middleware              | Purpose                                     |
+|-------------------------|---------------------------------------------|
+| `PreflightCORSMiddleware` | Explicit OPTIONS handling with CORS headers |
+| `GZipMiddleware`        | Response compression (min 1,000 bytes)      |
+| `CORSMiddleware`        | Standard CORS header injection              |

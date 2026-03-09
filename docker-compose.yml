@@ -48,6 +48,15 @@ services:
     volumes:
       - ezdocs_milvus:/var/lib/milvus
 
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ezdocs-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ezdocs_ollama:/root/.ollama
+
   # ─── Microservices ─────────────────────────────────────────────────────────
 
   graph:
@@ -151,3 +160,4 @@ volumes:
   ezdocs_pgdata:
   ezdocs_mongo:
   ezdocs_milvus:
+  ezdocs_ollama:

@@ -2,7 +2,7 @@
 EzDocs Backend API
 
 FastAPI backend for code dependency graphs and streaming LLM explanations.
-Option C: job queue (Upstash Redis) + worker in same process.
+In-process job queue + worker for async codebase analysis.
 Run from backend directory: python main.py
 """
 
@@ -103,7 +103,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if queue_available():
         worker = threading.Thread(target=_worker_loop, daemon=True)
         worker.start()
-        log.info("Job worker started (Option C queue).")
+        log.info("Job worker started.")
 
     yield
 

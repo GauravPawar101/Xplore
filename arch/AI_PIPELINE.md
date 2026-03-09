@@ -2,14 +2,14 @@
 
 ## AI Systems Overview
 
-Xplore has four distinct AI-powered systems:
+EzDocs has four distinct AI-powered systems:
 
-| System              | Purpose                                   | LLM Used                    |
-|---------------------|-------------------------------------------|-----------------------------|
-| Code Explanation    | Explain individual code symbols           | Ollama (local)              |
-| Codebase Narrator   | Interactive guided tour of codebases      | Ollama via LangGraph        |
-| RAG Chat            | Conversational search over code           | Ollama via LangChain        |
-| Code Generation     | Generate code from program intent graphs  | OpenAI / Anthropic / HF    |
+| System              | Purpose                                   | LLM Used                                    |
+|---------------------|-------------------------------------------|---------------------------------------------|
+| Code Explanation    | Explain individual code symbols           | Ollama (local) or HuggingFace Router (cloud)|
+| Codebase Narrator   | Linear BFS guided tour of codebases       | Ollama or HuggingFace Router                |
+| RAG Search          | Keyword + vector search over code         | HuggingFace Inference (embeddings only)     |
+| Code Generation     | Generate code from program intent graphs  | OpenAI / Anthropic / HuggingFace            |
 
 ---
 
@@ -18,29 +18,40 @@ Xplore has four distinct AI-powered systems:
 ### How It Works
 
 ```
-Code snippet + language
+Code snippet + context (callers, callees)
        │
        ▼
-Build chat messages:
-  system: "You are a code explanation assistant..."
-  user: "Explain this {language} code:\n{code}"
+_build_messages():
+  system: "You are a senior developer explaining code..."
+  context block: caller/callee graph context (if provided)
+  user: code snippet
        │
        ▼
-POST /api/chat to Ollama
-  model: qwen2.5-coder:8b (configurable via HF_MODEL_ID)
-  stream: true
+OpenAI-compatible client (streaming):
+  Ollama:  POST {OLLAMA_HOST}/v1/chat/completions
+  HF:      POST router.huggingface.co/v1/chat/completions
        │
        ▼
 Stream chunks back to caller
 ```
 
+### Provider Priority
+
+1. **Ollama** — Used when `OLLAMA_HOST` is set. Model: `OLLAMA_MODEL` (default: `qwen2.5-coder:3b`).
+2. **HuggingFace Router** — Fallback when Ollama is not configured. Model: `HF_MODEL_ID` (default: `Qwen/Qwen3-235B-A22B`).
+
+Both use the `openai` Python SDK as a client against OpenAI-compatible endpoints.
+
 ### Key Functions
 
-| Function                      | Description                                    |
-|-------------------------------|------------------------------------------------|
-| `_hf_chat_stream(messages)`   | Streams chat completion from Ollama `/api/chat`|
-| `generate_summary(node)`      | One-line summary for a graph node              |
-| `explain_code(code, lang)`    | Full explanation of a code snippet             |
+| Function                       | Description                                          |
+|--------------------------------|------------------------------------------------------|
+| `generate_explanation_stream`  | Async generator yielding streamed explanation chunks  |
+| `generate_explanation`         | Blocking single-shot explanation                      |
+| `generate_summary`             | One-line summary for a graph node                     |
+| `prefetch_explanations_sync`   | Batched parallel summary generation using ThreadPool  |
+| `explain_graph`                | Batch async explain for multiple nodes                |
+| `chat_stream`                  | Streaming conversational chat with context            |
 
 ### Batch Explanation (Jobs)
 
@@ -50,94 +61,39 @@ When a codebase is analyzed, a `graph_explain` background job generates summarie
 graph_explain job starts
        │
        ▼
-Load all non-library nodes
+Load all non-library nodes from job result
        │
        ▼
 For each node:
   generate_summary({name, type, code})
        │
        ▼
-Batch-write all summaries to Postgres
-  (one transaction via batch_update_summaries)
+Update each node summary individually in Postgres
+  via _update_node_summary()
 ```
 
 Aborts early if all nodes in a batch fail (indicates Ollama is unresponsive).
 
 ---
 
-## 2. Codebase Narrator
+## 2. Codebase Narrator (`shared/narrator.py`)
 
-### Architecture: LangGraph State Machine (`shared/narrator_graph.py`)
+### Architecture: Linear BFS Narrator
 
-The narrator is built as a **LangGraph `StateGraph`** with an interrupt-based pause mechanism for interactivity.
+The active narrator implementation (`shared/narrator.py`) uses a linear BFS walk through graph nodes, streaming explanations via WebSocket.
 
-### State Schema
+### Tour Planning
 
-```python
-class NarrationState(TypedDict):
-    nodes: list          # All graph nodes
-    edges: list          # All graph edges
-    tour_nodes: list     # Ordered list of nodes to narrate
-    current_index: int   # Position in tour_nodes
-    user_message: str    # Latest user input from WebSocket
-```
+1. **Find entry node** — Highest `entry_score` among all nodes.
+2. **Build BFS order** — Starting from the entry node, walk edges breadth-first.
+3. **Limit** — Up to 20 nodes in the tour (configurable).
 
-### State Machine Diagram
+### Functions
 
-```
-                    ┌─────────────┐
-                    │  plan_tour  │   Build BFS-ordered tour_nodes
-                    └──────┬──────┘   from entry point
-                           │
-                           ▼
-                ┌──────────────────┐
-           ┌───▶│  explain_node    │   Send focus frame + stream
-           │    │                  │   LLM explanation via WebSocket
-           │    └────────┬─────────┘
-           │             │
-           │             ▼
-           │    ┌──────────────────┐
-           │    │     pause        │   interrupt() — wait for
-           │    │                  │   user WebSocket message
-           │    └────────┬─────────┘
-           │             │
-           │             ▼
-           │    ┌──────────────────┐
-           │    │  route_input     │   Parse user_message:
-           │    │  (conditional)   │   "continue" | question | focus
-           │    └───┬────┬────┬───┘
-           │        │    │    │
-           │   continue  │   focus:{node_id}
-           │        │    │    │
-           │        ▼    │    ▼
-           │   ┌────────┐│  ┌────────────────┐
-           │   │advance ││  │ change_focus    │   Jump to
-           │   │ idx+1  ││  │ insert node,   │   requested node
-           │   └───┬────┘│  │ update index   │
-           │       │     │  └───────┬────────┘
-           │       │     │          │
-           └───────┘     │          └──────────▶ explain_node
-                         │
-                    question text
-                         │
-                         ▼
-                ┌──────────────────┐
-                │ answer_question  │   LLM answers scoped to
-                │                  │   current node's code context
-                └────────┬─────────┘
-                         │
-                         ▼
-                      advance → explain_node (loop)
-```
-
-### Tour Planning (`plan_tour_node`)
-
-Uses the same algorithm as the legacy narrator:
-
-1. **Find entry node** — Highest `entry_score`, with heuristic fallback (outdegree - indegree + name bonus).
-2. **Order entry file nodes** — Nodes in the entry file sorted by orchestrator-first (high out, low in, then line number).
-3. **BFS walk** — From entry file, visit cross-file nodes breadth-first.
-4. **Limit** — Up to 20 nodes in the tour.
+| Function            | Description                                              |
+|---------------------|----------------------------------------------------------|
+| `run_narration`     | Full codebase tour over WebSocket                        |
+| `run_node_narration`| Single-node deep-dive narration over WebSocket           |
 
 ### WebSocket Protocol
 
@@ -159,15 +115,21 @@ Messages sent from client to server:
 {"action": "focus", "node_id": "def456"}
 ```
 
+### LangGraph Narrator (`shared/narrator_graph.py`) — Unused
+
+A more advanced state-machine narrator built on LangGraph `StateGraph` with interrupt-based pause exists but is **not currently wired** into any router. `routers/narrator_ws.py` imports `shared.narrator`, not `shared.narrator_graph`.
+
+The LangGraph version has states: `plan_tour` → `explain_node` → `pause` → `route_input` (conditional: continue / question / focus).
+
 ### TTS Integration (Frontend)
 
-The narrator output supports two TTS backends:
-- **Browser SpeechSynthesis** — Built-in Web Speech API
-- **Kokoro AudioContext** — Higher-quality TTS via AudioContext
+The narrator output supports TTS on the frontend side:
+- **Browser SpeechSynthesis** — Built-in Web Speech API.
+- **Kokoro AudioContext** — Higher-quality TTS via AudioContext.
 
-Both operate on a sentence queue with cancellation refs. Two independent TTS pipelines exist:
-1. **Tour TTS** — For the full codebase tour
-2. **Node TTS** — For per-node deep-dive narration
+Both operate on a sentence queue with cancellation refs. Two independent TTS pipelines exist in `CodeMap.tsx`:
+1. **Tour TTS** — For the full codebase tour.
+2. **Node TTS** — For per-node deep-dive narration.
 
 ---
 
@@ -175,14 +137,14 @@ Both operate on a sentence queue with cancellation refs. Two independent TTS pip
 
 ### Components
 
-| Component           | File                    | Role                              |
-|---------------------|-------------------------|-----------------------------------|
-| Embedding Generator | `shared/embedding.py`   | Text → 768-dim vectors via Ollama |
-| Vector Store        | `shared/milvus_service.py` | Milvus ANN storage/search      |
-| Keyword Search      | `shared/db.py`          | Postgres pg_trgm ILIKE search    |
-| Hybrid Retriever    | `shared/rag_chain.py`   | Combines keyword + vector search |
-| Chat Chain          | `shared/rag_chain.py`   | Conversational RAG with history  |
-| Router Endpoints    | `routers/rag.py`        | HTTP API for query and indexing  |
+| Component           | File                         | Role                                      |
+|---------------------|------------------------------|-------------------------------------------|
+| Embedding Generator | `shared/embedding.py`        | Text → vectors via HF Inference API       |
+| Vector Store        | `shared/milvus_service.py`   | Milvus ANN storage/search                 |
+| Keyword Search      | `shared/db.py`               | Postgres ILIKE search on node columns     |
+| Router Endpoints    | `routers/rag.py`             | HTTP API for query and indexing            |
+
+**Note:** `shared/rag_chain.py` (LangChain hybrid retriever + conversational chain) exists but is **not imported** by `routers/rag.py`. The router calls `shared.db` and `shared.milvus_service` directly.
 
 ### Indexing Pipeline
 
@@ -190,17 +152,20 @@ Both operate on a sentence queue with cancellation refs. Two independent TTS pip
 POST /rag/index { codebase_id }
        │
        ▼
-Fetch all non-library graph_nodes from Postgres
-  WHERE analysis_id = codebase_id AND is_library = false
+Fetch all graph_nodes from Postgres
+  WHERE codebase_id = $1
+       │
+       ▼
+Filter: skip nodes where is_library = true or code is empty
        │
        ▼
 For each node (semaphore-bounded concurrency):
-  ┌─────────────────────────────────┐
-  │ embed_text(node.name + node.code) │
-  │   POST /api/embeddings → Ollama  │
-  │   Model: nomic-embed-text        │
-  │   → 768-dim float vector         │
-  └──────────────┬──────────────────┘
+  ┌─────────────────────────────────────┐
+  │ embed_text(node.name + " " + code)  │
+  │   POST api-inference.huggingface.co │
+  │   Model: nomic-ai/nomic-embed-text  │
+  │   → float vector (384 dims)         │
+  └──────────────┬──────────────────────┘
                  │
        Collect all (node_id, vector) pairs
                  │
@@ -208,138 +173,93 @@ For each node (semaphore-bounded concurrency):
   milvus_service.insert_embeddings(codebase_id, ids, vectors)
     - Delete existing vectors for this codebase
     - Insert fresh vectors
-    - IVF_FLAT index with inner product metric
+    - IVF_FLAT index, inner product metric
 ```
 
-### Hybrid Retrieval
-
-```python
-class CodebaseRetriever(BaseRetriever):
-    """Combines Postgres keyword + Milvus vector search."""
-```
-
-Query processing:
+### Query Pipeline
 
 ```
-User query: "how does authentication work?"
+POST /rag/query { codebase_id, query, k, use_vector?, program_id? }
        │
-       ├──────────────────┐
-       ▼                  ▼
-┌──────────────┐   ┌──────────────┐
-│ Postgres     │   │ Milvus       │
-│ db.rag_query │   │ embed_text   │
-│ _keyword()   │   │ (query) →    │
-│              │   │ milvus.search│
-│ ILIKE on     │   │ ANN top-k    │
-│ name, code   │   │              │
-└──────┬───────┘   └──────┬───────┘
-       │                  │
-       └──────┬───────────┘
-              ▼
-    Deduplicate by chunk ID
-    (keyword results + vector results)
-              │
-              ▼
-       Return combined top-k chunks
-```
-
-### Conversational Chat Chain
-
-```python
-build_chat_chain() → RunnableWithMessageHistory
-```
-
-```
-Chat prompt template:
-  system: "You are a codebase assistant. Use the following context
-           to answer the user's question about the code.
-           Context: {context}"
-  human: "{input}"
+       ├── Always: Postgres keyword search
+       │   db.rag_query_keyword(codebase_id, query, k, program_id)
+       │   ILIKE on name, filepath, code, summary
+       │
+       ├── If use_vector=true AND Milvus available:
+       │   embed_text(query) → query vector
+       │   milvus_service.search(codebase_id, query_vector, k)
        │
        ▼
-ChatOllama (local LLM)
-       │
-       ▼
-StrOutputParser
-       │
-       ▼
-Response (with session history via LRU cache)
+  Merge keyword + vector results
+  Deduplicate by node ID
+  Return top-k RagChunk list
 ```
 
-Session management:
-- `_LRUSessionStore` — Bounded `OrderedDict` (default max 100 sessions)
-- Each session stores `InMemoryChatMessageHistory`
-- Old sessions evicted LRU-style when limit exceeded
+### Embedding Configuration
+
+| Setting             | Default                           | Source                    |
+|---------------------|-----------------------------------|---------------------------|
+| Model               | `nomic-ai/nomic-embed-text-v1.5`  | `HF_EMBEDDING_MODEL_ID` |
+| Dimension           | 384                               | `EMBEDDING_DIM`          |
+| Input truncation    | 8,000 chars                       | Hardcoded                |
+| API                 | HuggingFace Inference             | `api-inference.huggingface.co` |
 
 ---
 
-## 4. Code Generation (`routers/program.py`)
+## 4. Code Generation (`routers/program.py` + `shared/llm_providers.py`)
 
 ### Program Graph Concept
 
-Users create "program graphs" — visual intent diagrams where each node represents a desired feature/behavior and edges show dependencies.
-
-```json
-{
-  "nodes": [
-    {"id": "1", "label": "User Auth", "description": "JWT-based login/signup"},
-    {"id": "2", "label": "API Routes", "description": "REST endpoints for CRUD"},
-    {"id": "3", "label": "Database", "description": "PostgreSQL with SQLAlchemy"}
-  ],
-  "edges": [
-    {"source": "2", "target": "1"},
-    {"source": "2", "target": "3"}
-  ]
-}
-```
+Users create "program graphs" — visual intent diagrams where each node represents a desired feature/behavior and edges show dependencies. These are stored in Postgres as JSONB.
 
 ### Summarization Pipeline
 
 ```
-POST /program/summarize { nodes, provider, api_keys }
+POST /program/summarize { program_id, provider, model?, api_keys? }
+       │
+       ▼
+Load program graph from Postgres
        │
        ▼
 For each node:
   LLM prompt: "Summarize this program component
-               in 1-2 sentences: {label}: {description}"
+               in 1-2 sentences: {label}: {content}"
        │
        ▼
   llm_providers.completion(provider, messages, model, api_keys)
        │
        ▼
-Return nodes with .summary field populated
+Update each node summary in Postgres (JSONB update)
+Return updated program graph
 ```
 
 ### Code Generation Pipeline
 
 ```
 POST /generate/code {
-  program_nodes,
-  program_edges,
-  codebase_id?,      ← optional: reference existing codebase
-  provider,
-  model?,
-  api_keys
+  program_id, codebase_id?, target_language, stack,
+  provider, model?, api_keys?, user_id?
 }
        │
        ▼
-(if codebase_id) RAG retrieval for context:
-  search(codebase_id, embed(summary), k=5) per node
+Load program graph from Postgres
+       │
+       ▼
+(if codebase_id) RAG context retrieval:
+  For each node summary → embed → Milvus search → top-k context
        │
        ▼
 Build prompt:
-  "Generate a complete implementation for this program.
+  "Generate a complete implementation...
+   Target: {target_language} / {stack}
    Program structure:
-   - Node 1: {label} - {summary} [depends on: Node 2, Node 3]
-   - Node 2: ...
-
-   Existing codebase context (optional):
-   {RAG results}
-
-   Output format: FILE: path/to/file.ext followed by code"
+   - Node 1: {label} - {content}
+   ...
+   Existing codebase context (if any):
+   {RAG results}"
        │
        ▼
-llm_providers.completion(provider, messages, model)
+llm_providers.completion(provider, messages, model, api_keys)
        │
        ▼
 Parse output:
@@ -355,31 +275,33 @@ Return { generation_id, artifacts }
 ### Multi-Provider LLM Abstraction (`shared/llm_providers.py`)
 
 ```
-completion(provider, messages, model, api_keys)
+completion(provider, messages, model?, api_keys?)
        │
        ├── provider == "openai"
-       │   └── OpenAI SDK → gpt-4o-mini (default)
+       │   └── OpenAI async SDK → gpt-4o-mini (default)
        │
        ├── provider == "anthropic"
-       │   └── Anthropic SDK → claude-3-5-haiku-20241022 (default)
+       │   └── Anthropic async SDK → claude-3-5-haiku-20241022 (default)
        │
        └── provider == "huggingface"
-           └── HF Inference API → configured HF_MODEL_ID
+           └── HF Inference API (api-inference.huggingface.co)
+               → HF_MODEL_ID (default: Qwen/Qwen3-235B-A22B)
 ```
 
-**BYOK (Bring Your Own Key):** Users can pass API keys in the request body via `api_keys`. If not provided, falls back to server-side environment variables. For HuggingFace, uses `token_manager.get_token()` for round-robin rotation across multiple tokens.
+**BYOK (Bring Your Own Key):** Users can pass API keys in the request body via `api_keys`. If not provided, falls back to server-side environment variables.
 
 ---
 
 ## LLM Models Used
 
-| System              | Model                    | Provider        | Purpose                  |
-|---------------------|--------------------------|-----------------|--------------------------|
-| Code Explanation    | qwen2.5-coder:8b        | Ollama (local)  | Explain code snippets    |
-| Narrator            | qwen2.5-coder:8b        | Ollama (local)  | Tour narration           |
-| RAG Chat            | qwen2.5-coder:8b        | Ollama (local)  | Conversational answers   |
-| Embeddings          | nomic-embed-text         | Ollama (local)  | 768-dim text embeddings  |
-| Summarization       | gpt-4o-mini / claude-3-5-haiku | OpenAI/Anthropic | Program node summaries |
-| Code Generation     | gpt-4o-mini / claude-3-5-haiku | OpenAI/Anthropic | Full code generation   |
+| System              | Default Model               | Provider             | Configurable Via        |
+|---------------------|-----------------------------|----------------------|-------------------------|
+| Code Explanation    | qwen2.5-coder:3b            | Ollama (local)       | `EZDOCS_MODEL`          |
+| Narrator            | qwen2.5-coder:3b            | Ollama (local)       | `EZDOCS_MODEL`          |
+| Chat                | qwen2.5-coder:3b            | Ollama (local)       | `EZDOCS_MODEL`          |
+| Explanation (cloud) | Qwen/Qwen3-235B-A22B        | HuggingFace Router   | `EZDOCS_HF_MODEL`       |
+| Embeddings          | nomic-ai/nomic-embed-text-v1.5 | HuggingFace Inference | `EZDOCS_HF_EMBEDDING_MODEL` |
+| Summarization       | gpt-4o-mini / claude-3-5-haiku | OpenAI / Anthropic | Per-request `model` param |
+| Code Generation     | gpt-4o-mini / claude-3-5-haiku | OpenAI / Anthropic | Per-request `model` param |
 
-Local LLM (Ollama) is used for all real-time, streaming operations. Cloud LLMs are used for batch summarization and code generation where quality matters more than latency.
+Ollama is used for all real-time, streaming operations when available. HuggingFace Router is the cloud fallback. Cloud LLMs (OpenAI/Anthropic) are used for code generation and program summarization where the user selects their provider.

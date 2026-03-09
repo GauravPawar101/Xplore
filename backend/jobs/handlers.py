@@ -1,11 +1,10 @@
 """
-Job handlers for Option C queue.
+Job handlers for the in-process job queue.
 Run in worker thread: pop job, dispatch by type, set result/failed.
 
 Job types:
   graph_analyze — parse codebase, persist to Postgres, auto-enqueue graph_explain
-  graph_explain — batch-generate explanations for user-code nodes; library blobs
-                  already have fixed one-line descriptions from GraphBuilder
+  graph_explain — batch-generate explanations for user-code nodes
 """
 
 import asyncio
@@ -155,7 +154,7 @@ def _run_graph_analyze(payload: dict) -> dict:
         try:
             import json as _json
             # Strip code from nodes before queuing — only need id, label, filepath, type
-            # to stay well under Upstash's 10 MB limit (code is already in Postgres)
+            # (code is already persisted in Postgres)
             slim_nodes = [
                 {
                     "id":   n.get("id", ""),

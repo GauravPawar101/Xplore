@@ -7,7 +7,6 @@ using NetworkX and UniversalParser. Uses parallel file parsing when configured.
 
 import json
 import logging
-import os
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -24,12 +23,23 @@ log = logging.getLogger("ezdocs.graph")
 
 IGNORED_DIRS: frozenset[str] = frozenset({
     ".git", ".hg", ".svn",
-    "node_modules",
+    # JS/TS package managers
+    "node_modules", "bower_components", "jspm_packages",
+    # Python virtualenvs and install locations
     "venv", ".venv", "env", ".env",
     "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache",
-    "dist", "build", "out", "target",
-    # pip install locations — prevent analysing installed packages
     "site-packages", "dist-packages",
+    # Build output
+    "dist", "build", "out", "target",
+    # Vendored / bundled 3rd-party code
+    "vendor",           # PHP Composer, Go modules, Ruby bundler
+    "third_party",      # C++/Bazel, Chromium-style repos
+    "Pods",             # iOS CocoaPods
+    "Carthage",         # iOS Carthage
+    ".yarn",            # Yarn Berry cache
+    ".npm",             # npm cache
+    # EzDocs runtime — cached clones / uploads from other analyses
+    "ingested_codebases",
 })
 
 ENTRY_POINT_NAMES: frozenset[str] = frozenset({
@@ -130,98 +140,33 @@ def tokenise(code: str, filepath: str) -> set[str]:
     return {t for t in fn(code) if len(t) >= MIN_NAME_LEN and t not in _COMMON_TOKENS}
 
 
-# ─── Local-import helpers ─────────────────────────────────────────────────────
-
-def _extract_local_import_paths(code: str, filepath: str) -> list[str]:
-    """Extract relative (local) import path strings from source code.
-
-    Only returns paths that start with ``'.'`` – these reference files within
-    the project rather than third-party packages or the standard library.
-
-    * JS/TS  – ``import X from './path'``  /  ``require('./path')``
-    * Python – ``from .module import X``   /  ``from ..pkg import Y``
-    """
-    ext = Path(filepath).suffix.lower()
-    paths: list[str] = []
-    if ext in (".js", ".ts", ".tsx", ".jsx"):
-        # ES module syntax
-        paths += re.findall(r'from\s+[\'"](\.[^\'"\s]+)[\'"]', code)
-        # CommonJS
-        paths += re.findall(r'require\s*\(\s*[\'"](\.[^\'"\s]+)[\'"]', code)
-    elif ext == ".py":
-        paths += [
-            p
-            for p in re.findall(r"from\s+(\.+\w*)\s+import", code, re.MULTILINE)
-            if p.startswith(".")
-        ]
-    return paths
+# Local-import helpers have been moved to graph/reconciliation.py.
+# GraphBuilder now delegates layer classification entirely to ReconciliationEngine.
 
 
-def _resolve_local_import(
-    import_path: str,
-    source_file: str,
-    all_filepaths: frozenset[str],
-) -> str | None:
-    """Resolve a relative import path to an actual file path within the project.
+import threading
 
-    Handles multi-level ``..`` traversal correctly so that, for example,
-    ``'../../models/user'`` imported from ``'src/api/index.js'`` resolves to
-    ``'models/user.js'`` when that file exists in *all_filepaths*.
-
-    Returns the normalised relative path string if a matching file exists,
-    otherwise ``None``.
-    """
-    source_dir = str(Path(source_file).parent)
-    # os.path.normpath resolves all '..' components correctly without requiring
-    # an absolute path, giving us a clean relative path like 'models/user'.
-    base = os.path.normpath(os.path.join(source_dir, import_path)).replace("\\", "/")
-    # Strip leading './' if present (root-level files sit under '.')
-    if base.startswith("./"):
-        base = base[2:]
-    ext = Path(source_file).suffix.lower()
-
-    if ext in (".js", ".ts", ".tsx", ".jsx"):
-        for cext in (".js", ".jsx", ".ts", ".tsx"):
-            if f"{base}{cext}" in all_filepaths:
-                return f"{base}{cext}"
-            if f"{base}/index{cext}" in all_filepaths:
-                return f"{base}/index{cext}"
-    elif ext == ".py":
-        # Use normpath for Python too, counting the number of leading dots to
-        # determine how many directory levels to ascend.
-        dot_count = len(import_path) - len(import_path.lstrip("."))
-        parent = source_dir
-        for _ in range(dot_count - 1):
-            parent = str(Path(parent).parent)
-        module = import_path.lstrip(".").replace(".", "/")
-        # 'from . import x' has an empty module part – we cannot resolve the
-        # target without parsing the import clause, so skip gracefully.
-        if module:
-            mod_base = os.path.normpath(os.path.join(parent, module)).replace("\\", "/")
-            if mod_base.startswith("./"):
-                mod_base = mod_base[2:]
-            for candidate in (
-                f"{mod_base}.py",
-                f"{mod_base}/__init__.py",
-            ):
-                if candidate in all_filepaths:
-                    return candidate
-    return None
+_thread_local = threading.local()
 
 
 def _parse_one_file(root_path: Path, file_path: Path) -> tuple[str, list[dict[str, Any]]]:
-    """Parse one file in isolation (for parallel workers). Returns (relative_path_str, list of ParseResult)."""
+    """Parse one file in isolation (for parallel workers).
+
+    Uses a thread-local parser so tree-sitter's native C library is only
+    initialised once per thread, avoiding race conditions.
+    """
     try:
-        parser = UniversalParser()
+        if not hasattr(_thread_local, "parser"):
+            _thread_local.parser = UniversalParser()
         try:
             from shared.config import MAX_FILE_SIZE
-            results = parser.parse_file(str(file_path), max_file_size=MAX_FILE_SIZE)
+            results = _thread_local.parser.parse_file(str(file_path), max_file_size=MAX_FILE_SIZE)
         except ImportError:
-            results = parser.parse_file(str(file_path))
+            results = _thread_local.parser.parse_file(str(file_path))
     except Exception as exc:
         log.warning("Parse error — %s: %s", file_path, exc)
-        return (str(file_path.relative_to(root_path)), [])
-    return (str(file_path.relative_to(root_path)), results)
+        return (str(file_path.relative_to(root_path)).replace("\\", "/"), [])
+    return (str(file_path.relative_to(root_path)).replace("\\", "/"), results)
 
 
 # ─── GraphBuilder ─────────────────────────────────────────────────────────────
@@ -245,42 +190,54 @@ class GraphBuilder:
     # ── Private helpers ────────────────────────────────────────────────────
 
     def _is_ignored(self, path: Path) -> bool:
-        return any(part in IGNORED_DIRS for part in path.parts)
+        """Check only relative path parts so absolute parent dirs don't
+        accidentally match IGNORED_DIRS names (e.g. a project living inside
+        a directory called 'build' or 'env' would otherwise be silently skipped)."""
+        try:
+            rel = path.relative_to(self.root_path)
+        except ValueError:
+            return False
+        return any(part in IGNORED_DIRS for part in rel.parts)
 
     def _collect_files(self, max_files: int) -> list[Path]:
-        # Collect root-level files and subdir files separately so that
-        # root (global) files are always processed first regardless of
-        # directory walk order.
-        root_files: list[Path] = []
-        subdir_files: list[Path] = []
+        """Breadth-first file collection.
 
-        for root, dirs, filenames in os.walk(self.root_path):
-            root_p = Path(root)
-            if self._is_ignored(root_p):
-                dirs.clear()   # prune subtree — prevents descending
-                continue
+        Processes ALL files at depth 0 (root), then ALL files at depth 1
+        across every subfolder, then depth 2, etc.  This guarantees that the
+        user's own top-level source files are always collected before the
+        engine descends into any deeply nested directory.
+        """
+        files: list[Path] = []
+        # BFS queue — start with the project root
+        queue: list[Path] = [self.root_path]
 
-            # Prune ignored subdirs in-place so os.walk skips them
-            dirs[:] = sorted([
-                d for d in dirs
-                if d not in IGNORED_DIRS and not d.startswith(".")
-            ])
+        while queue and len(files) < max_files:
+            next_queue: list[Path] = []
+            for dir_path in queue:
+                if self._is_ignored(dir_path):
+                    continue
+                try:
+                    entries = sorted(
+                        dir_path.iterdir(),
+                        key=lambda e: (e.is_dir(), e.name.lower()),
+                    )
+                except PermissionError:
+                    continue
 
-            is_root_level = root_p == self.root_path
-            for name in filenames:
-                fp = root_p / name
-                if self.parser.is_supported(str(fp)):
-                    if is_root_level:
-                        root_files.append(fp)
-                    else:
-                        subdir_files.append(fp)
+                for entry in entries:
+                    if entry.name in IGNORED_DIRS or entry.name.startswith("."):
+                        continue
+                    if entry.is_dir():
+                        next_queue.append(entry)
+                    elif entry.is_file() and self.parser.is_supported(str(entry)):
+                        files.append(entry)
+                        if len(files) >= max_files:
+                            log.warning("File limit reached (%d). Truncating.", max_files)
+                            return files
 
-        # Root-level (global) files first, then subdirectory files.
-        combined = root_files + subdir_files
-        if len(combined) > max_files:
-            log.warning("File limit reached (%d). Truncating.", max_files)
-            combined = combined[:max_files]
-        return combined
+            queue = sorted(next_queue, key=lambda d: d.name.lower())
+
+        return files
 
     def _process_file(self, file_path: Path) -> int:
         """Parse one file, add its nodes to the graph. Returns node count added."""
@@ -296,22 +253,28 @@ class GraphBuilder:
             return 0
 
         added = 0
+        fp_str = str(relative).replace("\\", "/")
         for item in results:
-            node_id = f"{relative}::{item['name']}"
+            node_id = f"{fp_str}::{item['name']}"
             if node_id in self.graph:
                 continue
-            self.graph.add_node(node_id, **item, filepath=str(relative))
+            # Normalise to forward slashes — Windows Path.relative_to() uses
+            # backslashes, which would cause path mismatches in the frontend.
+            self.graph.add_node(node_id, **item, filepath=fp_str)
             added += 1
         return added
 
     def _add_parsed_results(self, relative_path: str, results: list[dict]) -> int:
         """Add nodes from a parallel parse result. Returns count added."""
+        # Ensure forward slashes (relative_path comes from _parse_one_file which
+        # may return backslashes on Windows).
+        fp = relative_path.replace("\\", "/")
         added = 0
         for item in results:
-            node_id = f"{relative_path}::{item['name']}"
+            node_id = f"{fp}::{item['name']}"
             if node_id in self.graph:
                 continue
-            self.graph.add_node(node_id, **item, filepath=relative_path)
+            self.graph.add_node(node_id, **item, filepath=fp)
             added += 1
         return added
 
@@ -375,78 +338,62 @@ class GraphBuilder:
             if len(code) > max_len:
                 self.graph.nodes[_nid]["code"] = code[:max_len]
 
-    def _classify_node_layers(self) -> dict[str, int]:
-        """Classify each unique filepath in the graph into a display layer.
+    def _run_reconciliation(self) -> "ReconciliationSurface":  # noqa: F821
+        """Run the ReconciliationEngine over the current graph's file set.
 
-        * **Layer 0** – root-level files: files whose relative path contains no
-          directory separator (i.e. they live directly in the repository root).
-        * **Layer 1** – files directly imported by layer-0 files via local /
-          relative import statements (not third-party packages).
-        * **Layer 2** – everything else.
-
-        Returns a ``{filepath: layer}`` mapping.
+        Builds the entry-surface layer map (Layer 0 / 1 / 2) by delegating to
+        :class:`~graph.reconciliation.ReconciliationEngine`.  The result is
+        cached on ``self._reconciliation`` so it is computed only once per
+        ``build_graph()`` call.
         """
+        from graph.reconciliation import ReconciliationEngine  # local import avoids circular refs
+
         all_filepaths: frozenset[str] = frozenset(
             data["filepath"]
             for _, data in self.graph.nodes(data=True)
             if data.get("filepath")
         )
+        engine = ReconciliationEngine(str(self.root_path), all_filepaths)
+        surface = engine.build_surface()
+        self._reconciliation = surface
+        return surface
 
-        # Root-level files have no directory separator in their relative path
-        root_files: set[str] = {
-            fp for fp in all_filepaths
-            if "/" not in fp and "\\" not in fp
-        }
+    def _classify_node_layers(self) -> dict[str, int]:
+        """Return the {filepath: 0|1|2} layer map via ReconciliationEngine.
 
-        # Discover local dependencies of root files by reading their source
-        root_deps: set[str] = set()
-        for fp in root_files:
-            try:
-                code = (self.root_path / fp).read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-            for imp_path in _extract_local_import_paths(code, fp):
-                resolved = _resolve_local_import(imp_path, fp, all_filepaths)
-                if resolved and resolved not in root_files:
-                    root_deps.add(resolved)
-
-        layer_map: dict[str, int] = {}
-        for fp in all_filepaths:
-            if fp in root_files:
-                layer_map[fp] = 0
-            elif fp in root_deps:
-                layer_map[fp] = 1
-            else:
-                layer_map[fp] = 2
-
-        log.info(
-            "Layer classification — root: %d, direct-deps: %d, other: %d",
-            len(root_files),
-            len(root_deps),
-            len(all_filepaths) - len(root_files) - len(root_deps),
-        )
-        return layer_map
+        * **Layer 0** – root-level files (live directly in the repo root).
+        * **Layer 1** – local project files those root files directly import
+          (relative *and* bare-path imports), excluding third-party packages.
+        * **Layer 2** – everything else (models, views, controllers internals …).
+        """
+        if hasattr(self, "_reconciliation"):
+            return self._reconciliation.layer_map
+        return self._run_reconciliation().layer_map
 
     # ── Public API ─────────────────────────────────────────────────────────
 
     def build_graph(self, max_files: int = 200) -> nx.DiGraph:
         """
         Walk the root directory, parse source files, and build the graph.
-        Uses parallel parsing when EZDOCS_PARSE_WORKERS is set (default: auto).
+        Sequential by default; set EZDOCS_PARSE_WORKERS > 1 for parallel.
         """
         files = self._collect_files(max_files)
         log.info("Building graph from %d files in %s", len(files), self.root_path)
 
         try:
             from shared.config import PARSE_WORKERS
-            workers = PARSE_WORKERS if PARSE_WORKERS > 0 else min(32, (os.cpu_count() or 1) + 4)
+            workers = PARSE_WORKERS
         except ImportError:
             workers = 1
 
+        parsed_ok = 0
         if workers <= 1:
             total_nodes = 0
             for i, fp in enumerate(files, 1):
-                total_nodes += self._process_file(fp)
+                added = self._process_file(fp)
+                total_nodes += added
+                if added:
+                    parsed_ok += 1
                 if i % 50 == 0:
                     log.info("  …processed %d / %d files (%d nodes)", i, len(files), total_nodes)
         else:
@@ -459,13 +406,22 @@ class GraphBuilder:
                 done = 0
                 for future in as_completed(future_to_path):
                     rel_path, results = future.result()
-                    total_nodes += self._add_parsed_results(rel_path, results)
+                    added = self._add_parsed_results(rel_path, results)
+                    total_nodes += added
+                    if added:
+                        parsed_ok += 1
                     done += 1
                     if done % 50 == 0:
                         log.info("  …processed %d / %d files (%d nodes)", done, len(files), total_nodes)
 
+        failed = len(files) - parsed_ok
+        if failed:
+            log.warning("Parse results: %d files OK, %d files yielded 0 symbols.", parsed_ok, failed)
         log.info("Parsed %d code elements. Computing edges…", self.graph.number_of_nodes())
         self._create_edges()
+        # Run reconciliation immediately so the layer map and surface data are
+        # cached before to_json() or any caller inspects the graph.
+        self._run_reconciliation()
         log.info(
             "Graph complete: %d nodes, %d edges.",
             self.graph.number_of_nodes(),
@@ -582,7 +538,7 @@ class GraphBuilder:
                 "style":    {"strokeWidth": 2, "strokeOpacity": 0.7},
             })
 
-        return {"nodes": root_nodes + dep1_nodes + regular_nodes, "edges": rf_edges}
+        return {"nodes": root_nodes + dep1_nodes + regular_nodes, "edges": rf_edges, "reconciliation": self._reconciliation.to_api_dict() if hasattr(self, "_reconciliation") else None}
 
 
 # ─── Layout helpers (pure functions) ─────────────────────────────────────────

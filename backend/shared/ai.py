@@ -1,13 +1,17 @@
 """
 AI Layer — EzDocs
 
-Uses HuggingFace router via OpenAI-compatible client.
-  Chat/Explain : router.huggingface.co/v1  (any :provider suffixed model)
-  STT          : api-inference.huggingface.co  (Whisper — CPU task, old endpoint still works)
-  TTS          : api-inference.huggingface.co  (MMS-TTS / Chatterbox — same)
+Provider priority:
+  1. Ollama  — when OLLAMA_HOST is set (local Docker)
+  2. HF router — fallback when HF_TOKEN is set
+
+  STT  : api-inference.huggingface.co  (Whisper)
+  TTS  : api-inference.huggingface.co  (MMS-TTS / Chatterbox)
 
 .env keys:
-  HF_TOKEN (or HF_TOKEN)   — your HF access token
+  OLLAMA_HOST                       — e.g. http://ollama:11434
+  EZDOCS_MODEL                      — e.g. qwen2.5-coder:3b (default)
+  HF_TOKEN (or HF_TOKEN)            — HF access token (fallback)
   HF_MODEL_ID                       — e.g. Qwen/Qwen3.5-397B-A17B:novita
   TTS_MODEL                         — default: facebook/mms-tts-eng
   STT_MODEL                         — default: openai/whisper-large-v3
@@ -21,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from typing import AsyncIterator
 
-from shared.config import HUGGINGFACE_TOKEN, HUGGINGFACE_TOKEN0, HF_MODEL_ID
+from shared.config import HUGGINGFACE_TOKEN, HUGGINGFACE_TOKEN0, HF_MODEL_ID, OLLAMA_HOST, OLLAMA_MODEL
 
 log = logging.getLogger("ezdocs.ai")
 
@@ -45,6 +49,10 @@ _HF_STT_TIMEOUT = 60.0
 
 def _use_hf() -> bool:
     return bool(HF_TOKEN)
+
+
+def _use_ollama() -> bool:
+    return bool(OLLAMA_HOST)
 
 
 # ─── Errors ───────────────────────────────────────────────────────────────────
@@ -73,6 +81,48 @@ def _async_client():
         base_url="https://router.huggingface.co/v1",
         api_key=HF_TOKEN,
     )
+
+
+# ─── Ollama client (sync + async, OpenAI-compatible endpoint) ─────────────────
+
+@lru_cache(maxsize=1)
+def _ollama_sync_client():
+    from openai import OpenAI
+    return OpenAI(base_url=f"{OLLAMA_HOST}/v1", api_key="ollama")
+
+
+@lru_cache(maxsize=1)
+def _ollama_async_client():
+    from openai import AsyncOpenAI
+    return AsyncOpenAI(base_url=f"{OLLAMA_HOST}/v1", api_key="ollama")
+
+
+def _ollama_chat_sync(messages: list[dict], max_tokens: int = 512) -> str:
+    try:
+        resp = _ollama_sync_client().chat.completions.create(
+            model=OLLAMA_MODEL,
+            messages=messages,
+            max_tokens=max_tokens,
+        )
+        return resp.choices[0].message.content or ""
+    except Exception as exc:
+        raise AIProviderError(f"Ollama error: {exc}") from exc
+
+
+async def _ollama_chat_stream(messages: list[dict], max_tokens: int = 512):
+    try:
+        stream = await _ollama_async_client().chat.completions.create(
+            model=OLLAMA_MODEL,
+            messages=messages,
+            max_tokens=max_tokens,
+            stream=True,
+        )
+        async for chunk in stream:
+            delta = chunk.choices[0].delta.content
+            if delta:
+                yield delta
+    except Exception as exc:
+        raise AIProviderError(f"Ollama streaming error: {exc}") from exc
 
 
 # ─── Prompts ──────────────────────────────────────────────────────────────────
@@ -260,11 +310,15 @@ async def generate_explanation_stream(
     *,
     callers: list[str] | None = None,
 ) -> AsyncIterator[str]:
-    if not _use_hf():
-        raise AIProviderError("HF_TOKEN not configured.")
     messages = _build_messages(_EXPLAIN_TMPL, code, dependencies, filepath, callers=callers)
-    async for chunk in _hf_chat_stream(messages):
-        yield chunk
+    if _use_ollama():
+        async for chunk in _ollama_chat_stream(messages):
+            yield chunk
+    elif _use_hf():
+        async for chunk in _hf_chat_stream(messages):
+            yield chunk
+    else:
+        raise AIProviderError("No AI backend configured. Set OLLAMA_HOST or HF_TOKEN.")
 
 
 # ─── Blocking explanation ─────────────────────────────────────────────────────
@@ -277,10 +331,12 @@ def generate_explanation(
     *,
     callers: list[str] | None = None,
 ) -> str:
-    if not _use_hf():
-        raise AIProviderError("HF_TOKEN not configured.")
     messages = _build_messages(_EXPLAIN_TMPL, code, dependencies, filepath, callers=callers)
-    return _hf_chat_sync(messages)
+    if _use_ollama():
+        return _ollama_chat_sync(messages)
+    if _use_hf():
+        return _hf_chat_sync(messages)
+    raise AIProviderError("No AI backend configured. Set OLLAMA_HOST or HF_TOKEN.")
 
 
 # ─── Short summary ────────────────────────────────────────────────────────────
@@ -293,10 +349,13 @@ def generate_summary(
     *,
     callers: list[str] | None = None,
 ) -> str:
-    if not _use_hf():
-        raise AIProviderError("HF_TOKEN not configured.")
     messages = _build_messages(_SUMMARY_TMPL, code, dependencies, filepath, callers=callers)
-    text = _hf_chat_sync(messages, max_tokens=256)
+    if _use_ollama():
+        text = _ollama_chat_sync(messages, max_tokens=256)
+    elif _use_hf():
+        text = _hf_chat_sync(messages, max_tokens=256)
+    else:
+        raise AIProviderError("No AI backend configured. Set OLLAMA_HOST or HF_TOKEN.")
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     return "\n".join(lines[:4])
 
@@ -423,12 +482,16 @@ async def chat_stream(
 ) -> AsyncIterator[str]:
     if not messages:
         return
-    if not _use_hf():
-        raise AIProviderError("HF_TOKEN not configured.")
     if not any(m.get("role") == "system" for m in messages):
         messages = [{"role": "system", "content": _CHAT_SYSTEM}] + list(messages)
-    async for chunk in _hf_chat_stream(messages):
-        yield chunk
+    if _use_ollama():
+        async for chunk in _ollama_chat_stream(messages):
+            yield chunk
+    elif _use_hf():
+        async for chunk in _hf_chat_stream(messages):
+            yield chunk
+    else:
+        raise AIProviderError("No AI backend configured. Set OLLAMA_HOST or HF_TOKEN.")
 
 
 if __name__ == "__main__":

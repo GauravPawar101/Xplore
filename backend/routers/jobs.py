@@ -1,4 +1,4 @@
-"""Job queue endpoints (Option C): submit analyze job, poll status, get result."""
+"""Job queue endpoints: submit analyze job, poll status, get result."""
 
 import logging
 from typing import Any
@@ -23,7 +23,7 @@ async def submit_analyze_job(body: JobAnalyzeRequest) -> dict[str, Any]:
     if not is_available():
         raise HTTPException(
             status_code=503,
-            detail="Job queue not available. Set UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN.",
+            detail="Job queue not available.",
         )
     if not body.path and not body.url:
         raise HTTPException(status_code=400, detail="Provide path or url")

@@ -56,8 +56,8 @@ MAX_FILES_CEILING = int(os.getenv("EZDOCS_MAX_FILES_CEILING", "1000"))
 # Truncate code in API response to reduce payload (full code still used for edge detection)
 MAX_CODE_DISPLAY_LENGTH = int(os.getenv("EZDOCS_MAX_CODE_DISPLAY_LENGTH", "4000"))
 
-# Parallel file parsing (0 = auto from CPU count, 1 = sequential)
-PARSE_WORKERS = int(os.getenv("EZDOCS_PARSE_WORKERS", "0"))
+# Parallel file parsing (1 = sequential [default], >1 = explicit thread count)
+PARSE_WORKERS = int(os.getenv("EZDOCS_PARSE_WORKERS", "1"))
 
 # Prefetch AI explanations for every node during analysis (slow). If False, explanations load on demand when user clicks.
 PREFETCH_EXPLANATIONS = os.getenv("EZDOCS_PREFETCH_EXPLANATIONS", "false").lower() in ("true", "1", "yes")
@@ -94,6 +94,10 @@ HUGGINGFACE_TOKEN0 = os.getenv("HUGGINGFACE_HUB_TOKEN0", "").strip() or os.geten
 HF_MODEL_ID = os.getenv("EZDOCS_HF_MODEL", "Qwen/Qwen3-235B-A22B")
 HF_EMBEDDING_MODEL_ID = os.getenv("EZDOCS_HF_EMBEDDING_MODEL", "nomic-ai/nomic-embed-text-v1.5")
 
+# Ollama (local LLM — takes priority over HF when OLLAMA_HOST is set)
+OLLAMA_HOST  = os.getenv("OLLAMA_HOST",    "").strip()
+OLLAMA_MODEL = os.getenv("EZDOCS_MODEL",   "qwen2.5-coder:3b").strip()
+
 # ─── Ingestion ────────────────────────────────────────────────────────────────
 
 INGEST_DIR = Path(os.getenv("EZDOCS_INGEST_DIR", "./ingested_codebases"))
@@ -102,11 +106,9 @@ INGEST_DIR = Path(os.getenv("EZDOCS_INGEST_DIR", "./ingested_codebases"))
 
 CLERK_JWKS_URL = os.getenv("CLERK_JWKS_URL", "")
 
-# ─── Job queue (Option C: Upstash Redis) ──────────────────────────────────────
+# ─── Job queue ───────────────────────────────────────────────────────────────
 
-UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL", "")
-UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
-JOB_RESULT_TTL_SECONDS = int(os.getenv("EZDOCS_JOB_RESULT_TTL_SECONDS", "3600"))  # 1 hour
+JOB_RESULT_TTL_SECONDS = int(os.getenv("EZDOCS_JOB_RESULT_TTL_SECONDS", "3600"))  # kept for compat
 
 # ─── Microservices (used by gateway when proxying) ───────────────────────────
 

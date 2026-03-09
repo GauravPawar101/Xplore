@@ -71,17 +71,19 @@ async def close_pool() -> None:
 
 
 async def _init_schema(pool) -> None:
-    """Run init SQL if tables don't exist."""
+    """Run all migration SQL files in sorted order."""
     migrations_dir = Path(__file__).resolve().parent / "migrations"
-    init_sql = migrations_dir / "001_init.sql"
-    if not init_sql.exists():
+    if not migrations_dir.exists():
         return
-    sql = init_sql.read_text(encoding="utf-8")
-    # Run each statement (asyncpg execute() is single-statement)
-    statements = [s.strip() for s in sql.split(";") if s.strip() and not s.strip().startswith("--")]
+    sql_files = sorted(migrations_dir.glob("*.sql"))
     async with pool.acquire() as conn:
-        for stmt in statements:
-            if stmt:
+        for sql_file in sql_files:
+            sql = sql_file.read_text(encoding="utf-8")
+            # Strip single-line comments before splitting on semicolons to avoid
+            # semicolons inside comments (e.g. "-- foo; bar") breaking the parse.
+            lines = [l for l in sql.splitlines() if not l.strip().startswith("--")]
+            statements = [s.strip() for s in "\n".join(lines).split(";") if s.strip()]
+            for stmt in statements:
                 try:
                     await conn.execute(stmt)
                 except Exception as e:
