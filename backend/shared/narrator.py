@@ -99,16 +99,23 @@ async def _stream_explanation(ws: WebSocket, messages: list[dict], label: str) -
     Falls back to a graceful error message if HF fails.
     """
     try:
-        async for chunk in ai._hf_chat_stream(messages):
+        async for chunk in ai.chat_stream(messages):
             if chunk:
                 if not await _send_text(ws, chunk):
                     return False
         return True
     except _CLOSED:
         return False
+    except ai.AIProviderError as exc:
+        log.warning("Narration AI unavailable for %s: %s", label, exc)
+        return await _send_text(
+            ws,
+            "AI backend is unavailable for live narration. "
+            "Configure OLLAMA_HOST or HF_TOKEN, then retry.\n\n",
+        )
     except Exception as exc:
         log.warning("Narration failed for %s: %s", label, exc)
-        return await _send_text(ws, "*Explanation unavailable for this component.*\n\n")
+        return await _send_text(ws, "Unable to generate narration for this component right now.\n\n")
 
 
 async def run_narration(websocket: WebSocket, graph_cache: dict) -> None:

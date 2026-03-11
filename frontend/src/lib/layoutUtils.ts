@@ -122,8 +122,20 @@ export function treeLayout(
         }
     }
     const maxD = Math.max(0, ...fileDepth.values());
-    for (const fp of fileGroups.keys())
-        if (!fileDepth.has(fp)) fileDepth.set(fp, maxD + 1);
+    // For files not reached by BFS, use backend layer as depth hint;
+    // fall back to filesystem depth (path segment count) so root-dir files
+    // still appear earlier than deeply nested ones.
+    for (const [fp, nodes] of fileGroups) {
+        if (!fileDepth.has(fp)) {
+            const backendLayer = Number(nodes[0]?.data?.layer ?? -1);
+            if (backendLayer >= 0) {
+                fileDepth.set(fp, maxD + 1 + backendLayer);
+            } else {
+                const fsDepth = (fp.match(/[/\\]/g) || []).length;
+                fileDepth.set(fp, maxD + 1 + fsDepth);
+            }
+        }
+    }
 
     const nodeDepth = new Map<string, number>([[entry.id, 0]]);
     const nodeBfsQ = [entry.id];
@@ -146,6 +158,17 @@ export function treeLayout(
     for (const [fp, d] of fileDepth) {
         if (!depthCols.has(d)) depthCols.set(d, []);
         depthCols.get(d)!.push(fp);
+    }
+
+    // Sort files within each depth column: fewer path separators (closer to root dir) first,
+    // then alphabetically for stable ordering.
+    for (const [, files] of depthCols) {
+        files.sort((a, b) => {
+            const depthA = (a.match(/[/\\]/g) || []).length;
+            const depthB = (b.match(/[/\\]/g) || []).length;
+            if (depthA !== depthB) return depthA - depthB;
+            return a.localeCompare(b);
+        });
     }
 
     const CLUSTER_GAP_X = 450;

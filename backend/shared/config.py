@@ -50,8 +50,11 @@ PORT_AI = int(os.getenv("EZDOCS_PORT_AI", "8002"))
 
 # ─── Analysis ────────────────────────────────────────────────────────────────
 
-DEFAULT_MAX_FILES = int(os.getenv("EZDOCS_MAX_FILES", "200"))
-MAX_FILES_CEILING = int(os.getenv("EZDOCS_MAX_FILES_CEILING", "1000"))
+# max_files semantics:
+#   0  -> scan full codebase (no hard cap)
+#   >0 -> scan up to that many files
+DEFAULT_MAX_FILES = int(os.getenv("EZDOCS_MAX_FILES", "0"))
+MAX_FILES_CEILING = int(os.getenv("EZDOCS_MAX_FILES_CEILING", "50000"))
 
 # Truncate code in API response to reduce payload (full code still used for edge detection)
 MAX_CODE_DISPLAY_LENGTH = int(os.getenv("EZDOCS_MAX_CODE_DISPLAY_LENGTH", "4000"))
@@ -95,7 +98,7 @@ HF_MODEL_ID = os.getenv("EZDOCS_HF_MODEL", "Qwen/Qwen3-235B-A22B")
 HF_EMBEDDING_MODEL_ID = os.getenv("EZDOCS_HF_EMBEDDING_MODEL", "nomic-ai/nomic-embed-text-v1.5")
 
 # Ollama (local LLM — takes priority over HF when OLLAMA_HOST is set)
-OLLAMA_HOST  = os.getenv("OLLAMA_HOST",    "").strip()
+OLLAMA_HOST  = os.getenv("OLLAMA_HOST",    "http://127.0.0.1:11434").strip()
 OLLAMA_MODEL = os.getenv("EZDOCS_MODEL",   "qwen2.5-coder:3b").strip()
 
 # ─── Ingestion ────────────────────────────────────────────────────────────────

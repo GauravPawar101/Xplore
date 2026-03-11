@@ -8,6 +8,7 @@ preparing codebases for graph analysis.
 import logging
 import os
 import shutil
+import tempfile
 import uuid
 import zipfile
 from pathlib import Path
@@ -17,7 +18,9 @@ from fastapi import UploadFile
 
 log = logging.getLogger("ezdocs.ingest")
 
-INGEST_DIR = Path(os.getenv("EZDOCS_INGEST_DIR", "./ingested_codebases"))
+# Default to system temp so cloned repos don't trigger uvicorn's file watcher
+_DEFAULT_INGEST = os.path.join(tempfile.gettempdir(), "ezdocs_ingested")
+INGEST_DIR = Path(os.getenv("EZDOCS_INGEST_DIR", _DEFAULT_INGEST))
 INGEST_DIR.mkdir(parents=True, exist_ok=True)
 MAX_UNZIP_BYTES = int(os.getenv("EZDOCS_MAX_UNZIP_BYTES", 500 * 1024 * 1024))
 UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024

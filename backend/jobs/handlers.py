@@ -3,16 +3,20 @@ Job handlers for the in-process job queue.
 Run in worker thread: pop job, dispatch by type, set result/failed.
 
 Job types:
-  graph_analyze — parse codebase, persist to Postgres, auto-enqueue graph_explain
+  graph_analyze — parse codebase, persist to Postgres, return graph immediately,
+                  then explain root-layer nodes first and remaining in background.
   graph_explain — batch-generate explanations for user-code nodes
 """
 
 import asyncio
 import logging
+import threading
 from pathlib import Path
 
 from shared.config import MAX_FILES_CEILING, DATABASE_URL
-from shared.jobqueue import set_failed, set_result, set_running, enqueue
+from shared import db
+from shared.jobqueue import set_failed, set_progress, set_result, set_running
+from shared.request_control import raise_if_cancelled
 from routers.graph import build_graph_for
 from shared import ingest
 
@@ -45,6 +49,7 @@ def _persist_graph(codebase_id: str, nodes: list, edges: list, user_id: str, sou
         conn = await asyncpg.connect(DATABASE_URL)
         try:
             async with conn.transaction():
+                await conn.execute("DELETE FROM codebase_explanations WHERE codebase_id = $1", codebase_id)
                 await conn.execute("DELETE FROM graph_edges WHERE codebase_id = $1", codebase_id)
                 await conn.execute("DELETE FROM graph_nodes WHERE codebase_id = $1", codebase_id)
 
@@ -61,14 +66,18 @@ def _persist_graph(codebase_id: str, nodes: list, edges: list, user_id: str, sou
                         int(data.get("start_line") or 0),
                         int(data.get("end_line") or 0),
                         (data.get("code") or "")[:10000],
-                        # library blobs already have their explanation set by builder
-                        (data.get("explanation") or data.get("summary") or "")[:15000],
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
                     ))
                 await conn.copy_records_to_table(
                     "graph_nodes",
                     records=node_records,
                     columns=["codebase_id", "node_id", "name", "type", "filepath",
-                             "start_line", "end_line", "code", "summary"],
+                             "start_line", "end_line", "code", "summary",
+                             "explanation_line", "explanation_col", "explanation_offset", "explanation_length"],
                 )
 
                 seen: set = set()
@@ -105,33 +114,80 @@ def _persist_graph(codebase_id: str, nodes: list, edges: list, user_id: str, sou
         log.warning("Postgres persist skipped for %s: %s", codebase_id, e)
 
 
-def _update_node_summary(codebase_id: str, node_id: str, summary: str) -> None:
+def _persist_explanations(codebase_id: str, nodes: list[dict]) -> None:
+    """Write explanation blob to Postgres using a direct connection (own event loop)."""
     if not DATABASE_URL or "postgresql" not in DATABASE_URL:
+        log.warning("Postgres unavailable; explanations for %s not persisted.", codebase_id)
         return
 
     async def _write():
         import asyncpg
         conn = await asyncpg.connect(DATABASE_URL)
         try:
-            await conn.execute(
-                "UPDATE graph_nodes SET summary = $1 WHERE codebase_id = $2 AND node_id = $3",
-                summary[:15000], codebase_id, node_id,
-            )
+            content, refs = db._build_explanations_blob(nodes)
+            async with conn.transaction():
+                await conn.execute(
+                    """
+                    INSERT INTO codebase_explanations (codebase_id, content)
+                    VALUES ($1, $2)
+                    ON CONFLICT (codebase_id) DO UPDATE SET content = EXCLUDED.content
+                    """,
+                    codebase_id,
+                    content,
+                )
+                for node in nodes:
+                    nid = node.get("id", "")
+                    ref = refs.get(nid)
+                    await conn.execute(
+                        """
+                        UPDATE graph_nodes
+                        SET summary = NULL,
+                            explanation_line = $1,
+                            explanation_col = $2,
+                            explanation_offset = $3,
+                            explanation_length = $4
+                        WHERE codebase_id = $5 AND node_id = $6
+                        """,
+                        ref.get("line") if ref else None,
+                        ref.get("col") if ref else None,
+                        ref.get("offset") if ref else None,
+                        ref.get("length") if ref else None,
+                        codebase_id,
+                        nid,
+                    )
+            log.info("Persisted explanations for %s: %d refs", codebase_id, len(refs))
         finally:
             await conn.close()
 
-    try:
-        _run_async(_write())
-    except Exception as e:
-        log.warning("Summary update failed for %s/%s: %s", codebase_id, node_id, e)
+    _run_async(_write())
+
+
+def _update_node_summary(codebase_id: str, node_id: str, summary: str) -> None:
+    raise NotImplementedError("Per-node summary updates replaced by codebase explanation blob writes")
 
 
 # ─── graph_analyze ────────────────────────────────────────────────────────────
 
-def _run_graph_analyze(payload: dict) -> dict:
+def _sort_nodes_root_first(nodes: list[dict]) -> list[dict]:
+    """Sort nodes so layer-0 (root files) come first, then layer-1, then rest."""
+    def _layer_key(n: dict) -> int:
+        data = n.get("data") or {}
+        layer = data.get("layer")
+        if layer is not None:
+            return int(layer)
+        if data.get("is_root_file"):
+            return 0
+        if data.get("is_root_dep"):
+            return 1
+        return 2
+    return sorted(nodes, key=_layer_key)
+
+
+def _run_graph_analyze(payload: dict, job_id: str | None = None) -> dict:
     path        = payload.get("path")
     url         = payload.get("url")
-    max_files   = min(int(payload.get("max_files", 200)), MAX_FILES_CEILING)
+    raw_max_files = int(payload.get("max_files", 0))
+    max_files   = 0 if raw_max_files <= 0 else min(raw_max_files, MAX_FILES_CEILING)
     codebase_id = payload.get("codebase_id")
     user_id     = payload.get("user_id") or ""
 
@@ -142,56 +198,89 @@ def _run_graph_analyze(payload: dict) -> dict:
     else:
         raise ValueError("Either path or url is required")
 
+    if job_id:
+        set_progress(
+            job_id,
+            phase="analyzing",
+            message="Scanning files and building dependency graph...",
+            source_path=source_path,
+        )
+
     result = build_graph_for(
         source_path, max_files=max_files,
         codebase_id=codebase_id, user_id=user_id or None,
     )
 
+    if job_id:
+        set_progress(
+            job_id,
+            phase="persisting",
+            message="Saving graph snapshot...",
+            node_count=len(result.get("nodes", [])),
+            edge_count=len(result.get("edges", [])),
+        )
+
     if codebase_id:
         _persist_graph(codebase_id, result["nodes"], result["edges"], user_id, source_path)
 
-        # Auto-enqueue background explanation job
-        try:
-            import json as _json
-            # Strip code from nodes before queuing — only need id, label, filepath, type
-            # (code is already persisted in Postgres)
-            slim_nodes = [
-                {
-                    "id":   n.get("id", ""),
-                    "type": n.get("type", "default"),
-                    "data": {
-                        "label":      (n.get("data") or {}).get("label", ""),
-                        "type":       (n.get("data") or {}).get("type", "function"),
-                        "filepath":   (n.get("data") or {}).get("filepath", ""),
-                        "code":       (n.get("data") or {}).get("code", ""),
-                        "explanation":(n.get("data") or {}).get("explanation", ""),
-                    },
-                }
-                for n in result["nodes"]
-            ]
-            explain_job_id = enqueue("graph_explain", {
-                "codebase_id": codebase_id,
-                "nodes":       slim_nodes,
-            })
-            log.info("Enqueued explanation job %s for codebase %s", explain_job_id, codebase_id)
-        except Exception as e:
-            log.warning("Could not enqueue explanation job: %s", e)
-
-    return {
+    # Mark job done NOW so frontend can render the graph immediately.
+    graph_result = {
         "codebase_id": codebase_id,
+        "nodes": result.get("nodes", []),
+        "edges": result.get("edges", []),
         "node_count":  len(result.get("nodes", [])),
         "edge_count":  len(result.get("edges", [])),
         "source_path": source_path,
     }
 
+    if job_id:
+        set_progress(
+            job_id,
+            phase="complete",
+            message="Graph is ready. Explanations generating in background...",
+            node_count=len(result.get("nodes", [])),
+            edge_count=len(result.get("edges", [])),
+            explaining=True,
+        )
 
-# ─── graph_explain ────────────────────────────────────────────────────────────
+    # Fire off background explanation: root-layer nodes first, then the rest.
+    # Each batch persists to DB immediately so the frontend can poll /graph
+    # and see explanations appear incrementally.
+    if codebase_id and result.get("nodes"):
+        sorted_nodes = _sort_nodes_root_first(result["nodes"])
+        explain_thread = threading.Thread(
+            target=_run_graph_explain_background,
+            args=(codebase_id, sorted_nodes),
+            daemon=True,
+        )
+        explain_thread.start()
 
-def _run_graph_explain(payload: dict) -> dict:
+    return graph_result
+
+
+# ─── graph_explain (background, root-first) ──────────────────────────────────
+
+def _run_graph_explain_background(codebase_id: str, sorted_nodes: list[dict]) -> None:
+    """
+    Background thread: generate explanations root-first (layer 0 → 1 → 2+).
+    After each batch, persist updated explanation blob + pointers to Postgres
+    so the frontend sees explanations appear incrementally.
+    """
+    try:
+        _run_graph_explain({
+            "codebase_id": codebase_id,
+            "nodes": sorted_nodes,
+        })
+    except Exception as e:
+        log.warning("Background explanation failed for %s: %s", codebase_id, e)
+
+
+def _run_graph_explain(payload: dict, job_id: str | None = None) -> dict:
     """
     Batch-generate summaries for user-code nodes that have code but no explanation.
     Library blob nodes are skipped — they already have fixed blurbs from GraphBuilder.
-    Each summary is written back to graph_nodes.summary as it completes.
+    Nodes are processed in the order given (caller should sort root-first).
+    After each batch, the explanation blob is persisted to Postgres immediately.
     """
     codebase_id = payload.get("codebase_id")
     if not codebase_id:
@@ -199,7 +288,6 @@ def _run_graph_explain(payload: dict) -> dict:
 
     nodes: list[dict] = payload.get("nodes") or []
 
-    # Only explain user-code nodes that have code and no explanation yet
     explain_nodes = [
         n for n in nodes
         if n.get("type") != "library"
@@ -207,11 +295,23 @@ def _run_graph_explain(payload: dict) -> dict:
         and not (n.get("data") or {}).get("explanation", "").strip()
     ]
 
-    log.info("graph_explain: %d nodes to explain for codebase %s", len(explain_nodes), codebase_id)
+    log.info("graph_explain: %d nodes to explain for codebase %s (root-first order)",
+             len(explain_nodes), codebase_id)
+
+    if job_id:
+        set_progress(
+            job_id,
+            phase="explaining",
+            message=f"Generating explanations for {len(explain_nodes)} nodes...",
+            explained_done=0,
+            explained_failed=0,
+            explained_total=len(explain_nodes),
+        )
 
     from shared.ai import generate_summary, AIProviderError
 
     done = failed = 0
+    generated: dict[str, str] = {}
     for i in range(0, len(explain_nodes), _EXPLAIN_BATCH_SIZE):
         batch = explain_nodes[i: i + _EXPLAIN_BATCH_SIZE]
         for node in batch:
@@ -222,7 +322,7 @@ def _run_graph_explain(payload: dict) -> dict:
             fp   = data.get("filepath", "")
             try:
                 summary = generate_summary(code, [], fp)
-                _update_node_summary(codebase_id, nid, summary)
+                generated[nid] = summary
                 done += 1
             except AIProviderError as e:
                 log.warning("Explain failed for %s: %s", name, e)
@@ -231,12 +331,49 @@ def _run_graph_explain(payload: dict) -> dict:
                 log.warning("Unexpected explain error for %s: %s", name, e)
                 failed += 1
 
+        batch_num = i // _EXPLAIN_BATCH_SIZE + 1
+        total_batches = (len(explain_nodes) + _EXPLAIN_BATCH_SIZE - 1) // _EXPLAIN_BATCH_SIZE
         log.info("Explanations progress: %d done, %d failed (batch %d/%d)",
-                 done, failed,
-                 i // _EXPLAIN_BATCH_SIZE + 1,
-                 (len(explain_nodes) + _EXPLAIN_BATCH_SIZE - 1) // _EXPLAIN_BATCH_SIZE)
+                 done, failed, batch_num, total_batches)
+
+        if job_id:
+            set_progress(
+                job_id,
+                phase="explaining",
+                message=(
+                    f"Generating explanations... {done}/{len(explain_nodes)} complete"
+                    if explain_nodes else
+                    "No node explanations were needed."
+                ),
+                explained_done=done,
+                explained_failed=failed,
+                explained_total=len(explain_nodes),
+            )
+
+        # Persist after every batch so explanations appear incrementally in DB.
+        if generated:
+            hydrated = _hydrate_nodes_with_explanations(nodes, generated)
+            try:
+                _persist_explanations(codebase_id, hydrated)
+                log.info("Incremental persist after batch %d: %d explanations for %s",
+                         batch_num, len(generated), codebase_id)
+            except Exception as e:
+                log.warning("Incremental explanation persist failed for %s: %s", codebase_id, e)
 
     return {"codebase_id": codebase_id, "explained": done, "failed": failed}
+
+
+def _hydrate_nodes_with_explanations(nodes: list[dict], generated: dict[str, str]) -> list[dict]:
+    """Merge generated explanations into node copies for blob persistence."""
+    hydrated: list[dict] = []
+    for node in nodes:
+        copied = dict(node)
+        copied_data = dict(node.get("data") or {})
+        if node.get("id") in generated:
+            copied_data["explanation"] = generated[node["id"]]
+        copied["data"] = copied_data
+        hydrated.append(copied)
+    return hydrated
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -257,10 +394,10 @@ def run_job(job_id: str, payload: dict) -> None:
     job_type = payload.get("type", "")
     try:
         if job_type == "graph_analyze":
-            result = _run_graph_analyze(payload)
+            result = _run_graph_analyze(payload, job_id=job_id)
             set_result(job_id, result)
         elif job_type == "graph_explain":
-            result = _run_graph_explain(payload)
+            result = _run_graph_explain(payload, job_id=job_id)
             set_result(job_id, result)
             log.info("Explanation job %s complete: %s", job_id, result)
         else:

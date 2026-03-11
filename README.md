@@ -1,4 +1,4 @@
-# EzDocs
+# Xplore
 
 Code dependency visualizer with AI-powered explanations and guided narration.
 

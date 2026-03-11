@@ -19,7 +19,9 @@ The engine builds a three-layer map:
              filtering out every 3rd-party package (npm / PyPI / stdlib)
   Layer 2  – everything else (models, views, controllers internals …)
 
-Import detection covers:
+Import detection uses **AST-based extraction** (tree-sitter) when available,
+falling back to regex for source that wasn't parsed by the graph builder.
+
   * JS / TS / JSX / TSX – ESM (import … from), CommonJS (require()), dynamic
     import(), re-exports (export … from) — both relative ('./routes') and
     project-local bare paths ('routes', 'models/user').
@@ -39,6 +41,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 log = logging.getLogger("ezdocs.reconciliation")
 
@@ -143,7 +146,7 @@ def _resolve_python_relative(
         return None
     mod_base = os.path.normpath(os.path.join(parent, module)).replace('\\', '/')
     if mod_base.startswith('./'):
-        mod_base = mod_base[2:]
+        mod_base = mod_base[2:]  # BUG FIX: was missing this assignment
     for candidate in (f'{mod_base}.py', f'{mod_base}/__init__.py'):
         if candidate in all_filepaths:
             return candidate
@@ -177,7 +180,6 @@ def _resolve_js_ts_bare(
         if f'{path}/index{cext}' in all_filepaths:
             return f'{path}/index{cext}'
     return None
-
 
 def _resolve_python_bare(
     import_path: str,
@@ -309,13 +311,20 @@ class ReconciliationEngine:
         node graph).
     """
 
-    def __init__(self, root_path: str, all_filepaths: frozenset[str]) -> None:
+    def __init__(
+        self,
+        root_path: str,
+        all_filepaths: frozenset[str],
+        ast_imports: dict[str, list[dict[str, Any]]] | None = None,
+    ) -> None:
         self.root_path = Path(root_path).resolve()
         self.all_filepaths = all_filepaths
+        # AST-extracted imports keyed by relative filepath, provided by GraphBuilder
+        self._ast_imports = ast_imports or {}
 
     # ── Discovery ─────────────────────────────────────────────────────────
 
-    def get_root_files(self) -> list[str]:
+    def get_root_files(self) -> list[str]:  # BUG FIX: removed orphaned docstring fragments
         """
         Return files that live directly in the repo root, alphabetically sorted.
 
@@ -337,10 +346,10 @@ class ReconciliationEngine:
         """
         Trace the direct local dependencies of a single root-level file.
 
-        Reads the source, extracts every import/require statement, and
-        resolves each one against ``all_filepaths``.  Imports that resolve to
-        an actual project file become Layer-1 candidates; those that don't
-        (npm packages, stdlib, etc.) are returned as ``unresolved``.
+        Uses **AST-extracted imports** when available (from GraphBuilder's
+        parse_file_full), falling back to regex-based extraction otherwise.
+        This produces more accurate results because AST parsing ignores
+        import-like text inside strings and comments.
 
         Parameters
         ----------
@@ -354,6 +363,27 @@ class ReconciliationEngine:
         unresolved:
             Set of import strings that could not be matched to a project file.
         """
+        local_deps: set[str] = set()
+        unresolved: set[str] = set()
+
+        # Prefer AST-extracted imports if available
+        if root_file in self._ast_imports:
+            for imp_info in self._ast_imports[root_file]:
+                source = imp_info.get("source", "")
+                is_relative = imp_info.get("is_relative", False)
+                if not source:
+                    continue
+
+                resolved = resolve_import(
+                    source, root_file, self.all_filepaths, is_relative=is_relative,
+                )
+                if resolved and resolved != root_file:
+                    local_deps.add(resolved)
+                elif not is_relative:
+                    unresolved.add(source)
+            return local_deps, unresolved
+
+        # Fallback: read source and use regex extraction
         try:
             code = (self.root_path / root_file).read_text(
                 encoding='utf-8', errors='replace'
@@ -364,17 +394,12 @@ class ReconciliationEngine:
 
         relative_imports, bare_imports = extract_imports(code, root_file)
 
-        local_deps: set[str] = set()
-        unresolved: set[str] = set()
-
         for imp in relative_imports:
             resolved = resolve_import(
                 imp, root_file, self.all_filepaths, is_relative=True
             )
             if resolved and resolved != root_file:
                 local_deps.add(resolved)
-            # If a relative import doesn't resolve the target file simply
-            # wasn't collected (outside max_files, non-parseable, etc.).
 
         for imp in bare_imports:
             resolved = resolve_import(

@@ -32,6 +32,10 @@ def enqueue(job_type: str, payload: dict[str, Any]) -> str | None:
         _job_store[job_id] = {
             "status": "pending",
             "payload": {"type": job_type, **payload},
+            "progress": {
+                "phase": "queued",
+                "message": "Queued for analysis...",
+            },
         }
     _job_queue.put(job_id)
     return job_id
@@ -44,6 +48,8 @@ def get_status(job_id: str) -> dict | None:
     if entry is None:
         return None
     out: dict[str, Any] = {"status": entry["status"]}
+    if entry.get("progress") is not None:
+        out["progress"] = entry["progress"]
     if entry["status"] == "done":
         out["result"] = entry.get("result")
     elif entry["status"] == "failed":
@@ -64,6 +70,14 @@ def set_running(job_id: str) -> None:
     with _lock:
         if job_id in _job_store:
             _job_store[job_id]["status"] = "running"
+
+
+def set_progress(job_id: str, **progress: Any) -> None:
+    with _lock:
+        if job_id in _job_store:
+            existing = dict(_job_store[job_id].get("progress") or {})
+            existing.update({k: v for k, v in progress.items() if v is not None})
+            _job_store[job_id]["progress"] = existing
 
 
 def set_result(job_id: str, result: Any) -> None:

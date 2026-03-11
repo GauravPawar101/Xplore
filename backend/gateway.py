@@ -1,6 +1,5 @@
 """
 EzDocs API Gateway — launcher.
-
 Run from backend/: python gateway.py
 Delegates to gateway.app (see gateway/app.py).
 """

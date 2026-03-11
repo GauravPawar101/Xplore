@@ -16,6 +16,7 @@ from typing import Any
 import networkx as nx
 
 from shared.parser import UniversalParser
+from shared.request_control import raise_if_cancelled
 
 log = logging.getLogger("ezdocs.graph")
 
@@ -40,6 +41,21 @@ IGNORED_DIRS: frozenset[str] = frozenset({
     ".npm",             # npm cache
     # EzDocs runtime — cached clones / uploads from other analyses
     "ingested_codebases",
+    # Common caches and tool outputs
+    ".cache", "coverage", ".next", ".nuxt", ".turbo", "tmp", "temp",
+})
+
+# Process files in fixed batches so very large codebases remain stable while
+# still completing full analysis before returning graph output.
+ANALYSIS_BATCH_SIZE = 200
+
+IGNORED_FILE_SUFFIXES: tuple[str, ...] = (
+    ".min.js", ".min.css", ".map", ".lock", ".pyc",
+)
+
+IGNORED_FILE_NAMES: frozenset[str] = frozenset({
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock",
+    "Cargo.lock", "uv.lock",
 })
 
 ENTRY_POINT_NAMES: frozenset[str] = frozenset({
@@ -149,24 +165,37 @@ import threading
 _thread_local = threading.local()
 
 
-def _parse_one_file(root_path: Path, file_path: Path) -> tuple[str, list[dict[str, Any]]]:
+def _parse_one_file(root_path: Path, file_path: Path) -> tuple[str, dict[str, Any] | list[dict[str, Any]]]:
     """Parse one file in isolation (for parallel workers).
 
     Uses a thread-local parser so tree-sitter's native C library is only
     initialised once per thread, avoiding race conditions.
+
+    Returns (relative_path, full_result_or_definitions).
+    When parse_file_full succeeds the second element is a FullParseResult dict;
+    otherwise falls back to the basic definitions list for compatibility.
     """
+    rel = str(file_path.relative_to(root_path)).replace("\\", "/")
+    if not hasattr(_thread_local, "parser"):
+        _thread_local.parser = UniversalParser()
+
     try:
-        if not hasattr(_thread_local, "parser"):
-            _thread_local.parser = UniversalParser()
-        try:
-            from shared.config import MAX_FILE_SIZE
-            results = _thread_local.parser.parse_file(str(file_path), max_file_size=MAX_FILE_SIZE)
-        except ImportError:
-            results = _thread_local.parser.parse_file(str(file_path))
+        from shared.config import MAX_FILE_SIZE
+        max_fs = MAX_FILE_SIZE
+    except ImportError:
+        max_fs = 1024 * 1024
+
+    try:
+        # Prefer full AST parse (definitions + calls + imports)
+        full = _thread_local.parser.parse_file_full(str(file_path), max_file_size=max_fs)
+        if full is not None:
+            return (rel, full)
+        # Fallback to basic parse
+        results = _thread_local.parser.parse_file(str(file_path), max_file_size=max_fs)
+        return (rel, results)
     except Exception as exc:
         log.warning("Parse error — %s: %s", file_path, exc)
-        return (str(file_path.relative_to(root_path)).replace("\\", "/"), [])
-    return (str(file_path.relative_to(root_path)).replace("\\", "/"), results)
+        return (rel, [])
 
 
 # ─── GraphBuilder ─────────────────────────────────────────────────────────────
@@ -182,10 +211,46 @@ class GraphBuilder:
         payload = builder.to_json()   # Ready for React Flow
     """
 
-    def __init__(self, root_path: str) -> None:
+    def __init__(self, root_path: str, request_id: str | None = None) -> None:
         self.root_path: Path    = Path(root_path).resolve()
         self.parser:    UniversalParser = UniversalParser()
         self.graph:     nx.DiGraph      = nx.DiGraph()
+        self.request_id = request_id
+        self._collected_filepaths: set[str] = set()
+        # AST-extracted call data: node_id → list of called names
+        self._ast_calls: dict[str, list[str]] = {}
+        # AST-extracted import data: filepath → list of import dicts
+        self._ast_imports: dict[str, list[dict[str, Any]]] = {}
+
+    def _add_file_placeholder(self, file_path: Path, relative_path: str | None = None) -> int:
+        fp_str = relative_path or str(file_path.relative_to(self.root_path)).replace("\\", "/")
+        node_id = f"{fp_str}::__file__"
+        if node_id in self.graph:
+            return 0
+
+        try:
+            raw = file_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            raw = ""
+
+        try:
+            from shared.config import MAX_CODE_DISPLAY_LENGTH
+            code_display = raw[:MAX_CODE_DISPLAY_LENGTH]
+        except ImportError:
+            code_display = raw[:4000]
+
+        end_line = max(1, raw.count("\n") + 1) if raw else 1
+        self.graph.add_node(
+            node_id,
+            name=Path(fp_str).name,
+            type="file",
+            filepath=fp_str,
+            start_line=1,
+            end_line=end_line,
+            code=code_display,
+            is_placeholder=True,
+        )
+        return 1
 
     # ── Private helpers ────────────────────────────────────────────────────
 
@@ -199,7 +264,21 @@ class GraphBuilder:
             return False
         return any(part in IGNORED_DIRS for part in rel.parts)
 
-    def _collect_files(self, max_files: int) -> list[Path]:
+    def _should_skip_file(self, file_path: Path, max_file_size: int) -> bool:
+        name = file_path.name
+        lname = name.lower()
+        if name in IGNORED_FILE_NAMES:
+            return True
+        if any(lname.endswith(sfx) for sfx in IGNORED_FILE_SUFFIXES):
+            return True
+        try:
+            if file_path.stat().st_size > max_file_size:
+                return True
+        except OSError:
+            return True
+        return False
+
+    def _collect_files(self, max_files: int | None) -> list[Path]:
         """Breadth-first file collection.
 
         Processes ALL files at depth 0 (root), then ALL files at depth 1
@@ -208,12 +287,19 @@ class GraphBuilder:
         engine descends into any deeply nested directory.
         """
         files: list[Path] = []
+        effective_limit = None if max_files is None or max_files <= 0 else max_files
+        try:
+            from shared.config import MAX_FILE_SIZE
+            max_file_size = MAX_FILE_SIZE
+        except ImportError:
+            max_file_size = 1024 * 1024
         # BFS queue — start with the project root
         queue: list[Path] = [self.root_path]
 
-        while queue and len(files) < max_files:
+        while queue and (effective_limit is None or len(files) < effective_limit):
             next_queue: list[Path] = []
             for dir_path in queue:
+                raise_if_cancelled(self.request_id)
                 if self._is_ignored(dir_path):
                     continue
                 try:
@@ -230,9 +316,11 @@ class GraphBuilder:
                     if entry.is_dir():
                         next_queue.append(entry)
                     elif entry.is_file() and self.parser.is_supported(str(entry)):
+                        if self._should_skip_file(entry, max_file_size):
+                            continue
                         files.append(entry)
-                        if len(files) >= max_files:
-                            log.warning("File limit reached (%d). Truncating.", max_files)
+                        if effective_limit is not None and len(files) >= effective_limit:
+                            log.warning("File limit reached (%d). Truncating.", effective_limit)
                             return files
 
             queue = sorted(next_queue, key=lambda d: d.name.lower())
@@ -242,33 +330,104 @@ class GraphBuilder:
     def _process_file(self, file_path: Path) -> int:
         """Parse one file, add its nodes to the graph. Returns node count added."""
         relative = file_path.relative_to(self.root_path)
+        fp_str = str(relative).replace("\\", "/")
+
         try:
             try:
                 from shared.config import MAX_FILE_SIZE
-                results = self.parser.parse_file(str(file_path), max_file_size=MAX_FILE_SIZE)
+                max_fs = MAX_FILE_SIZE
             except ImportError:
-                results = self.parser.parse_file(str(file_path))
+                max_fs = 1024 * 1024
+
+            # Prefer full AST parse (definitions + calls + imports)
+            full_result = self.parser.parse_file_full(str(file_path), max_file_size=max_fs)
+
+            if full_result is not None:
+                results = full_result["definitions"]
+                scoped_calls = full_result.get("scoped_calls", {})
+                ast_imports = full_result.get("imports", [])
+
+                if ast_imports:
+                    self._ast_imports[fp_str] = ast_imports
+
+                if not results:
+                    return self._add_file_placeholder(file_path, fp_str)
+
+                added = 0
+                for item in results:
+                    node_id = f"{fp_str}::{item['name']}"
+                    if node_id in self.graph:
+                        continue
+                    self.graph.add_node(node_id, **item, filepath=fp_str)
+                    added += 1
+                    # Store scoped calls for this node
+                    if item["name"] in scoped_calls:
+                        self._ast_calls[node_id] = scoped_calls[item["name"]]
+
+                # Store module-level calls under a pseudo-node
+                if "__module__" in scoped_calls:
+                    file_node = f"{fp_str}::__file__"
+                    if file_node in self.graph:
+                        self._ast_calls[file_node] = scoped_calls["__module__"]
+                return added
+
+            # Fallback to basic parse
+            results = self.parser.parse_file(str(file_path), max_file_size=max_fs)
         except Exception as exc:
             log.warning("Parse error — %s: %s", file_path, exc)
-            return 0
+            return self._add_file_placeholder(file_path)
+
+        if not results:
+            return self._add_file_placeholder(file_path, fp_str)
 
         added = 0
-        fp_str = str(relative).replace("\\", "/")
         for item in results:
             node_id = f"{fp_str}::{item['name']}"
             if node_id in self.graph:
                 continue
-            # Normalise to forward slashes — Windows Path.relative_to() uses
-            # backslashes, which would cause path mismatches in the frontend.
             self.graph.add_node(node_id, **item, filepath=fp_str)
             added += 1
         return added
 
-    def _add_parsed_results(self, relative_path: str, results: list[dict]) -> int:
-        """Add nodes from a parallel parse result. Returns count added."""
-        # Ensure forward slashes (relative_path comes from _parse_one_file which
-        # may return backslashes on Windows).
+    def _add_parsed_results(self, relative_path: str, results: dict | list) -> int:
+        """Add nodes from a parallel parse result. Returns count added.
+
+        ``results`` may be a FullParseResult dict (from parse_file_full) or
+        a plain list of definitions (legacy fallback).
+        """
         fp = relative_path.replace("\\", "/")
+
+        # Handle full AST result
+        if isinstance(results, dict) and "definitions" in results:
+            definitions = results["definitions"]
+            scoped_calls = results.get("scoped_calls", {})
+            ast_imports = results.get("imports", [])
+
+            if ast_imports:
+                self._ast_imports[fp] = ast_imports
+
+            if not definitions:
+                return self._add_file_placeholder(self.root_path / fp, fp)
+
+            added = 0
+            for item in definitions:
+                node_id = f"{fp}::{item['name']}"
+                if node_id in self.graph:
+                    continue
+                self.graph.add_node(node_id, **item, filepath=fp)
+                added += 1
+                if item["name"] in scoped_calls:
+                    self._ast_calls[node_id] = scoped_calls[item["name"]]
+
+            if "__module__" in scoped_calls:
+                file_node = f"{fp}::__file__"
+                if file_node in self.graph:
+                    self._ast_calls[file_node] = scoped_calls["__module__"]
+            return added
+
+        # Legacy: plain list of definitions
+        if not results:
+            return self._add_file_placeholder(self.root_path / fp, fp)
         added = 0
         for item in results:
             node_id = f"{fp}::{item['name']}"
@@ -280,12 +439,20 @@ class GraphBuilder:
 
     def _create_edges(self) -> None:
         """
-        Heuristic edge detection: for each node, tokenise its source code and
-        check which other node names appear in those tokens.
+        Hybrid AST + heuristic edge detection.
 
-        Two-pass approach:
-          1. Build a name → [node_id] index for fast lookup.
-          2. Scan each node's code and emit edges where names match.
+        **Phase 1 (AST-precise):** For every node that has scoped call data
+        from tree-sitter, look up each called name in the symbol index. This
+        produces high-confidence edges because tree-sitter only captures
+        actual call expressions — not names in strings, comments, or type
+        annotations.
+
+        **Phase 2 (regex fallback):** For nodes without AST call data (e.g.
+        languages where the call query failed), fall back to the original
+        regex tokenisation approach.
+
+        This two-phase strategy ensures correctness improves for all supported
+        languages while maintaining backward compatibility.
         """
         # Index: name → list of node IDs that define that name
         name_index: dict[str, list[str]] = {}
@@ -295,12 +462,44 @@ class GraphBuilder:
                 name_index.setdefault(name, []).append(node_id)
 
         edge_count = 0
+        ast_resolved = 0
+        regex_resolved = 0
+
         for source_id, source_data in self.graph.nodes(data=True):
             code     = source_data.get("code", "")
             filepath = source_data.get("filepath", "")
             if not code:
                 continue
 
+            # Phase 1: AST-based edges (preferred)
+            if source_id in self._ast_calls:
+                call_names = self._ast_calls[source_id]
+                seen_targets: set[str] = set()
+                for call_name in call_names:
+                    if call_name not in name_index:
+                        continue
+                    if len(call_name) < MIN_NAME_LEN or call_name in _COMMON_TOKENS:
+                        continue
+                    for target_id in name_index[call_name]:
+                        if target_id == source_id:
+                            continue
+                        if target_id in seen_targets:
+                            continue
+                        seen_targets.add(target_id)
+                        if self.graph.has_edge(source_id, target_id):
+                            continue
+
+                        edge_type = (
+                            "INSTANTIATES"
+                            if self.graph.nodes[target_id].get("type") == "class"
+                            else "CALLS"
+                        )
+                        self.graph.add_edge(source_id, target_id, type=edge_type)
+                        edge_count += 1
+                        ast_resolved += 1
+                continue  # Skip regex for this node — AST data is authoritative
+
+            # Phase 2: Regex fallback for nodes without AST call data
             tokens = tokenise(code, filepath)
             for token in tokens:
                 if token not in name_index:
@@ -311,7 +510,6 @@ class GraphBuilder:
                     if self.graph.has_edge(source_id, target_id):
                         continue
 
-                    # Prefer INSTANTIATES when the target is a class
                     edge_type = (
                         "INSTANTIATES"
                         if self.graph.nodes[target_id].get("type") == "class"
@@ -319,8 +517,12 @@ class GraphBuilder:
                     )
                     self.graph.add_edge(source_id, target_id, type=edge_type)
                     edge_count += 1
+                    regex_resolved += 1
 
-        log.info("Created %d dependency edges.", edge_count)
+        log.info(
+            "Created %d dependency edges (%d AST-precise, %d regex-fallback).",
+            edge_count, ast_resolved, regex_resolved,
+        )
         self._truncate_node_code_for_memory()
 
     def _truncate_node_code_for_memory(self) -> None:
@@ -345,15 +547,16 @@ class GraphBuilder:
         :class:`~graph.reconciliation.ReconciliationEngine`.  The result is
         cached on ``self._reconciliation`` so it is computed only once per
         ``build_graph()`` call.
+
+        Passes AST-extracted imports when available for higher accuracy.
         """
         from graph.reconciliation import ReconciliationEngine  # local import avoids circular refs
 
-        all_filepaths: frozenset[str] = frozenset(
-            data["filepath"]
-            for _, data in self.graph.nodes(data=True)
-            if data.get("filepath")
+        all_filepaths: frozenset[str] = frozenset(self._collected_filepaths)
+        engine = ReconciliationEngine(
+            str(self.root_path), all_filepaths,
+            ast_imports=self._ast_imports if self._ast_imports else None,
         )
-        engine = ReconciliationEngine(str(self.root_path), all_filepaths)
         surface = engine.build_surface()
         self._reconciliation = surface
         return surface
@@ -372,12 +575,16 @@ class GraphBuilder:
 
     # ── Public API ─────────────────────────────────────────────────────────
 
-    def build_graph(self, max_files: int = 200) -> nx.DiGraph:
+    def build_graph(self, max_files: int = 0) -> nx.DiGraph:
         """
         Walk the root directory, parse source files, and build the graph.
         Sequential by default; set EZDOCS_PARSE_WORKERS > 1 for parallel.
         """
         files = self._collect_files(max_files)
+        self._collected_filepaths = {
+            str(fp.relative_to(self.root_path)).replace("\\", "/")
+            for fp in files
+        }
         log.info("Building graph from %d files in %s", len(files), self.root_path)
 
         try:
@@ -389,35 +596,62 @@ class GraphBuilder:
         parsed_ok = 0
         if workers <= 1:
             total_nodes = 0
-            for i, fp in enumerate(files, 1):
-                added = self._process_file(fp)
-                total_nodes += added
-                if added:
-                    parsed_ok += 1
-                if i % 50 == 0:
-                    log.info("  …processed %d / %d files (%d nodes)", i, len(files), total_nodes)
-        else:
-            total_nodes = 0
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                future_to_path = {
-                    executor.submit(_parse_one_file, self.root_path, fp): fp
-                    for fp in files
-                }
-                done = 0
-                for future in as_completed(future_to_path):
-                    rel_path, results = future.result()
-                    added = self._add_parsed_results(rel_path, results)
+            total_batches = (len(files) + ANALYSIS_BATCH_SIZE - 1) // ANALYSIS_BATCH_SIZE
+            for batch_idx in range(total_batches):
+                raise_if_cancelled(self.request_id)
+                start = batch_idx * ANALYSIS_BATCH_SIZE
+                end = min(start + ANALYSIS_BATCH_SIZE, len(files))
+                batch = files[start:end]
+                for fp in batch:
+                    raise_if_cancelled(self.request_id)
+                    added = self._process_file(fp)
                     total_nodes += added
                     if added:
                         parsed_ok += 1
-                    done += 1
-                    if done % 50 == 0:
-                        log.info("  …processed %d / %d files (%d nodes)", done, len(files), total_nodes)
+                log.info(
+                    "  …processed batch %d/%d (%d/%d files, %d nodes)",
+                    batch_idx + 1,
+                    total_batches,
+                    end,
+                    len(files),
+                    total_nodes,
+                )
+        else:
+            total_nodes = 0
+            total_batches = (len(files) + ANALYSIS_BATCH_SIZE - 1) // ANALYSIS_BATCH_SIZE
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                done = 0
+                for batch_idx in range(total_batches):
+                    raise_if_cancelled(self.request_id)
+                    start = batch_idx * ANALYSIS_BATCH_SIZE
+                    end = min(start + ANALYSIS_BATCH_SIZE, len(files))
+                    batch = files[start:end]
+                    future_to_path = {
+                        executor.submit(_parse_one_file, self.root_path, fp): fp
+                        for fp in batch
+                    }
+                    for future in as_completed(future_to_path):
+                        raise_if_cancelled(self.request_id)
+                        rel_path, results = future.result()
+                        added = self._add_parsed_results(rel_path, results)
+                        total_nodes += added
+                        if added:
+                            parsed_ok += 1
+                        done += 1
+                    log.info(
+                        "  …processed batch %d/%d (%d/%d files, %d nodes)",
+                        batch_idx + 1,
+                        total_batches,
+                        done,
+                        len(files),
+                        total_nodes,
+                    )
 
         failed = len(files) - parsed_ok
         if failed:
             log.warning("Parse results: %d files OK, %d files yielded 0 symbols.", parsed_ok, failed)
         log.info("Parsed %d code elements. Computing edges…", self.graph.number_of_nodes())
+        raise_if_cancelled(self.request_id)
         self._create_edges()
         # Run reconciliation immediately so the layer map and surface data are
         # cached before to_json() or any caller inspects the graph.
@@ -453,6 +687,34 @@ class GraphBuilder:
         layer_map = self._classify_node_layers()
         has_root_files = any(lyr == 0 for lyr in layer_map.values())
 
+        primary_entry_file: str | None = None
+        root_files: list[str] = []
+        if hasattr(self, "_reconciliation"):
+            root_files = list(self._reconciliation.root_files)
+
+        if root_files:
+            preferred_order = (
+                "main", "index", "app", "server", "cli", "run", "start", "init", "setup"
+            )
+
+            def _rank(fp: str) -> tuple[int, int, str]:
+                stem = Path(fp).stem.lower()
+                try:
+                    name_rank = preferred_order.index(stem)
+                except ValueError:
+                    name_rank = 999
+                # Prefer python/ts/js entry files when names tie
+                ext_rank = {
+                    ".py": 0,
+                    ".ts": 1,
+                    ".tsx": 2,
+                    ".js": 3,
+                    ".jsx": 4,
+                }.get(Path(fp).suffix.lower(), 10)
+                return (name_rank, ext_rank, fp)
+
+            primary_entry_file = min(root_files, key=_rank)
+
         root_nodes:    list[dict] = []   # layer 0 – files in the repo root
         dep1_nodes:    list[dict] = []   # layer 1 – direct local deps of root files
         regular_nodes: list[dict] = []   # layer 2+ – everything else
@@ -479,9 +741,11 @@ class GraphBuilder:
             # Root-level files are always treated as entry points; keyword
             # matching is kept as a fallback for repos where code lives only
             # inside subdirectories.
-            is_entry = is_root_file or any(
-                kw in name_lower or kw in file_lower for kw in ENTRY_POINT_NAMES
-            )
+            is_entry = bool(primary_entry_file and filepath == primary_entry_file)
+            if not primary_entry_file:
+                is_entry = is_root_file or any(
+                    kw in name_lower or kw in file_lower for kw in ENTRY_POINT_NAMES
+                )
 
             rf_node = {
                 "id":   node_id,
@@ -493,6 +757,7 @@ class GraphBuilder:
                     "start_line":   data.get("start_line", 0),
                     "end_line":     data.get("end_line", 0),
                     "code":         code_display,
+                    "isEntry":      is_entry,
                     "is_root_file": is_root_file,
                     "is_root_dep":  is_root_dep,
                     "layer":        layer,

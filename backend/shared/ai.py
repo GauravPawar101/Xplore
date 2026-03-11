@@ -312,13 +312,21 @@ async def generate_explanation_stream(
 ) -> AsyncIterator[str]:
     messages = _build_messages(_EXPLAIN_TMPL, code, dependencies, filepath, callers=callers)
     if _use_ollama():
-        async for chunk in _ollama_chat_stream(messages):
-            yield chunk
-    elif _use_hf():
+        try:
+            async for chunk in _ollama_chat_stream(messages):
+                yield chunk
+            return
+        except AIProviderError as exc:
+            if not _use_hf():
+                raise
+            log.warning("Ollama stream failed, falling back to HF: %s", exc)
+
+    if _use_hf():
         async for chunk in _hf_chat_stream(messages):
             yield chunk
-    else:
-        raise AIProviderError("No AI backend configured. Set OLLAMA_HOST or HF_TOKEN.")
+        return
+
+    raise AIProviderError("No AI backend configured. Set OLLAMA_HOST or HF_TOKEN.")
 
 
 # ─── Blocking explanation ─────────────────────────────────────────────────────
@@ -333,7 +341,12 @@ def generate_explanation(
 ) -> str:
     messages = _build_messages(_EXPLAIN_TMPL, code, dependencies, filepath, callers=callers)
     if _use_ollama():
-        return _ollama_chat_sync(messages)
+        try:
+            return _ollama_chat_sync(messages)
+        except AIProviderError as exc:
+            if not _use_hf():
+                raise
+            log.warning("Ollama explain failed, falling back to HF: %s", exc)
     if _use_hf():
         return _hf_chat_sync(messages)
     raise AIProviderError("No AI backend configured. Set OLLAMA_HOST or HF_TOKEN.")
@@ -351,7 +364,13 @@ def generate_summary(
 ) -> str:
     messages = _build_messages(_SUMMARY_TMPL, code, dependencies, filepath, callers=callers)
     if _use_ollama():
-        text = _ollama_chat_sync(messages, max_tokens=256)
+        try:
+            text = _ollama_chat_sync(messages, max_tokens=256)
+        except AIProviderError as exc:
+            if not _use_hf():
+                raise
+            log.warning("Ollama summary failed, falling back to HF: %s", exc)
+            text = _hf_chat_sync(messages, max_tokens=256)
     elif _use_hf():
         text = _hf_chat_sync(messages, max_tokens=256)
     else:
@@ -485,13 +504,21 @@ async def chat_stream(
     if not any(m.get("role") == "system" for m in messages):
         messages = [{"role": "system", "content": _CHAT_SYSTEM}] + list(messages)
     if _use_ollama():
-        async for chunk in _ollama_chat_stream(messages):
-            yield chunk
-    elif _use_hf():
+        try:
+            async for chunk in _ollama_chat_stream(messages):
+                yield chunk
+            return
+        except AIProviderError as exc:
+            if not _use_hf():
+                raise
+            log.warning("Ollama chat failed, falling back to HF: %s", exc)
+
+    if _use_hf():
         async for chunk in _hf_chat_stream(messages):
             yield chunk
-    else:
-        raise AIProviderError("No AI backend configured. Set OLLAMA_HOST or HF_TOKEN.")
+        return
+
+    raise AIProviderError("No AI backend configured. Set OLLAMA_HOST or HF_TOKEN.")
 
 
 if __name__ == "__main__":

@@ -16,6 +16,54 @@ log = logging.getLogger("ezdocs.db")
 _pool: Any = None
 
 
+def _compute_line_col(content: str, offset: int) -> tuple[int, int]:
+    line = content.count("\n", 0, offset) + 1
+    last_newline = content.rfind("\n", 0, offset)
+    col = offset + 1 if last_newline == -1 else offset - last_newline
+    return line, col
+
+
+def _slice_explanation(content: str, offset: int | None, length: int | None) -> str:
+    if offset is None or length is None or offset < 0 or length <= 0:
+        return ""
+    return content[offset: offset + length]
+
+
+def _build_explanations_blob(nodes: list[dict[str, Any]]) -> tuple[str, dict[str, dict[str, int]]]:
+    sections: list[str] = []
+    refs: dict[str, dict[str, int]] = {}
+    cursor = 0
+
+    for node in nodes:
+        nid = node.get("id", "")
+        data = node.get("data", {})
+        explanation = (data.get("explanation") or data.get("summary") or "").strip()
+        if not nid or not explanation:
+            continue
+
+        label = data.get("label", nid)
+        filepath = data.get("filepath", "")
+        section = f"## {label}\n{filepath}\n{explanation}\n\n"
+        explanation_offset = cursor + len(f"## {label}\n{filepath}\n")
+        line, col = _compute_line_col(section, len(f"## {label}\n{filepath}\n"))
+        refs[nid] = {
+            "line": 0,
+            "col": col,
+            "offset": explanation_offset,
+            "length": len(explanation),
+        }
+        sections.append(section)
+        cursor += len(section)
+
+    content = "".join(sections)
+    if refs:
+        for node_id, ref in refs.items():
+            line, col = _compute_line_col(content, ref["offset"])
+            ref["line"] = line
+            ref["col"] = col
+    return content, refs
+
+
 def _pool_is_alive(pool) -> bool:
     """Return False if the pool is closed or bound to a dead event loop."""
     try:
@@ -119,20 +167,28 @@ async def write_codebase_graph(
 
     async with pool.acquire() as conn:
         if clear_first:
+            await conn.execute("DELETE FROM codebase_explanations WHERE codebase_id = $1", codebase_id)
             await conn.execute("DELETE FROM graph_edges WHERE codebase_id = $1", codebase_id)
             await conn.execute("DELETE FROM graph_nodes WHERE codebase_id = $1", codebase_id)
 
         for n in nodes:
             nid = n.get("id", "")
             data = n.get("data", {})
-            summary = (data.get("explanation") or data.get("summary") or "")[:15000]
             await conn.execute(
                 """
-                INSERT INTO graph_nodes (codebase_id, node_id, name, type, filepath, start_line, end_line, code, summary)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                INSERT INTO graph_nodes (
+                    codebase_id, node_id, name, type, filepath, start_line, end_line, code,
+                    summary, explanation_line, explanation_col, explanation_offset, explanation_length
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, NULL, NULL, NULL, NULL)
                 ON CONFLICT (codebase_id, node_id) DO UPDATE SET
                     name = EXCLUDED.name, type = EXCLUDED.type, filepath = EXCLUDED.filepath,
-                    start_line = EXCLUDED.start_line, end_line = EXCLUDED.end_line, code = EXCLUDED.code, summary = EXCLUDED.summary
+                    start_line = EXCLUDED.start_line, end_line = EXCLUDED.end_line, code = EXCLUDED.code,
+                    summary = NULL,
+                    explanation_line = NULL,
+                    explanation_col = NULL,
+                    explanation_offset = NULL,
+                    explanation_length = NULL
                 """,
                 codebase_id,
                 nid,
@@ -142,7 +198,6 @@ async def write_codebase_graph(
                 data.get("start_line", 0),
                 data.get("end_line", 0),
                 (data.get("code") or "")[:10000],
-                summary,
             )
 
         for e in edges:
@@ -174,6 +229,48 @@ async def write_codebase_graph(
     return True
 
 
+async def write_codebase_explanations(codebase_id: str, nodes: list[dict[str, Any]]) -> bool:
+    pool = await get_pool()
+    if not pool:
+        return False
+
+    content, refs = _build_explanations_blob(nodes)
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO codebase_explanations (codebase_id, content)
+            VALUES ($1, $2)
+            ON CONFLICT (codebase_id) DO UPDATE SET content = EXCLUDED.content
+            """,
+            codebase_id,
+            content,
+        )
+
+        for node in nodes:
+            nid = node.get("id", "")
+            ref = refs.get(nid)
+            await conn.execute(
+                """
+                UPDATE graph_nodes
+                SET summary = NULL,
+                    explanation_line = $1,
+                    explanation_col = $2,
+                    explanation_offset = $3,
+                    explanation_length = $4
+                WHERE codebase_id = $5 AND node_id = $6
+                """,
+                ref.get("line") if ref else None,
+                ref.get("col") if ref else None,
+                ref.get("offset") if ref else None,
+                ref.get("length") if ref else None,
+                codebase_id,
+                nid,
+            )
+
+    return True
+
+
 async def list_analyses(user_id: Optional[str] = None, limit: int = 100) -> list[dict[str, Any]]:
     """List saved codebase analyses (codebase_id, source_path, created_at). Optionally filter by user_id."""
     pool = await get_pool()
@@ -197,6 +294,29 @@ async def list_analyses(user_id: Optional[str] = None, limit: int = 100) -> list
     ]
 
 
+async def explanation_progress(codebase_id: str) -> Optional[dict[str, Any]]:
+    """Return { total, explained, pending } counts for a codebase."""
+    pool = await get_pool()
+    if not pool:
+        return None
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT
+                COUNT(*) AS total,
+                COUNT(*) FILTER (WHERE explanation_offset IS NOT NULL) AS explained
+            FROM graph_nodes
+            WHERE codebase_id = $1
+            """,
+            codebase_id,
+        )
+    if not row or row["total"] == 0:
+        return None
+    total = row["total"]
+    explained = row["explained"]
+    return {"total": total, "explained": explained, "pending": total - explained}
+
+
 async def read_codebase_graph(codebase_id: str) -> Optional[dict[str, Any]]:
     """Load codebase graph from Postgres into React Flow style { nodes, edges }."""
     pool = await get_pool()
@@ -204,9 +324,15 @@ async def read_codebase_graph(codebase_id: str) -> Optional[dict[str, Any]]:
         return None
 
     async with pool.acquire() as conn:
+        explanation_row = await conn.fetchrow(
+            "SELECT content FROM codebase_explanations WHERE codebase_id = $1",
+            codebase_id,
+        )
+        explanation_content = explanation_row["content"] if explanation_row else ""
         rows = await conn.fetch(
             """
-            SELECT node_id, name, type, filepath, start_line, end_line, code, summary
+            SELECT node_id, name, type, filepath, start_line, end_line, code,
+                   explanation_line, explanation_col, explanation_offset, explanation_length
             FROM graph_nodes WHERE codebase_id = $1
             """,
             codebase_id,
@@ -225,7 +351,11 @@ async def read_codebase_graph(codebase_id: str) -> Optional[dict[str, Any]]:
                     "start_line": r["start_line"] or 0,
                     "end_line": r["end_line"] or 0,
                     "code": r["code"] or "",
-                    "explanation": r["summary"] or "",
+                    "explanation": _slice_explanation(explanation_content, r["explanation_offset"], r["explanation_length"]),
+                    "explanation_line": r["explanation_line"],
+                    "explanation_col": r["explanation_col"],
+                    "explanation_offset": r["explanation_offset"],
+                    "explanation_length": r["explanation_length"],
                 },
                 "position": {"x": 0, "y": 0},
             }
@@ -251,18 +381,18 @@ async def read_codebase_graph(codebase_id: str) -> Optional[dict[str, Any]]:
 
 
 async def set_symbol_summary(codebase_id: str, symbol_id: str, summary: str) -> bool:
-    """Set summary for a graph node."""
+    """Backward-compatible single-node explanation write into the shared codebase blob."""
     pool = await get_pool()
     if not pool:
         return False
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE graph_nodes SET summary = $1 WHERE codebase_id = $2 AND node_id = $3",
-            summary,
-            codebase_id,
-            symbol_id,
-        )
-    return True
+    graph = await read_codebase_graph(codebase_id)
+    if not graph:
+        return False
+    for node in graph.get("nodes", []):
+        if node.get("id") == symbol_id:
+            node.setdefault("data", {})["explanation"] = summary
+            break
+    return await write_codebase_explanations(codebase_id, graph.get("nodes", []))
 
 
 # ─── Program graph ───────────────────────────────────────────────────────────
@@ -385,7 +515,7 @@ async def rag_query_keyword(
     k: int = 10,
     program_id: Optional[str] = None,
 ) -> list[dict[str, Any]]:
-    """Keyword search over graph_nodes (name, filepath, code, summary). Optionally include program graph nodes."""
+    """Keyword search over graph nodes. Optionally include program graph nodes."""
     pool = await get_pool()
     if not pool:
         return []
@@ -394,12 +524,17 @@ async def rag_query_keyword(
     chunks: list[dict[str, Any]] = []
 
     async with pool.acquire() as conn:
+        explanation_row = await conn.fetchrow(
+            "SELECT content FROM codebase_explanations WHERE codebase_id = $1",
+            codebase_id,
+        )
+        explanation_content = explanation_row["content"] if explanation_row else ""
         rows = await conn.fetch(
             """
-            SELECT node_id, name, filepath, summary, code
+            SELECT node_id, name, filepath, code, explanation_offset, explanation_length
             FROM graph_nodes
             WHERE codebase_id = $1
-              AND (LOWER(name) LIKE $2 OR LOWER(filepath) LIKE $2 OR LOWER(COALESCE(code, '')) LIKE $2 OR LOWER(COALESCE(summary, '')) LIKE $2)
+              AND (LOWER(name) LIKE $2 OR LOWER(filepath) LIKE $2 OR LOWER(COALESCE(code, '')) LIKE $2)
             LIMIT $3
             """,
             codebase_id,
@@ -407,12 +542,13 @@ async def rag_query_keyword(
             k,
         )
         for r in rows:
+            explanation = _slice_explanation(explanation_content, r["explanation_offset"], r["explanation_length"])
             chunks.append({
                 "id": r["node_id"],
                 "type": "symbol",
                 "name": r["name"],
                 "filepath": r["filepath"],
-                "summary": r["summary"],
+                "summary": explanation,
                 "code": r["code"],
             })
 
@@ -442,9 +578,14 @@ async def get_graph_nodes_by_ids(codebase_id: str, symbol_ids: list[str]) -> lis
     if not pool or not symbol_ids:
         return []
     async with pool.acquire() as conn:
+        explanation_row = await conn.fetchrow(
+            "SELECT content FROM codebase_explanations WHERE codebase_id = $1",
+            codebase_id,
+        )
+        explanation_content = explanation_row["content"] if explanation_row else ""
         rows = await conn.fetch(
             """
-            SELECT node_id, name, filepath, summary, code
+            SELECT node_id, name, filepath, code, explanation_offset, explanation_length
             FROM graph_nodes
             WHERE codebase_id = $1 AND node_id = ANY($2::text[])
             """,
@@ -457,7 +598,7 @@ async def get_graph_nodes_by_ids(codebase_id: str, symbol_ids: list[str]) -> lis
             "type": "symbol",
             "name": r["name"],
             "filepath": r["filepath"],
-            "summary": r["summary"],
+            "summary": _slice_explanation(explanation_content, r["explanation_offset"], r["explanation_length"]),
             "code": r["code"],
         }
         for r in rows

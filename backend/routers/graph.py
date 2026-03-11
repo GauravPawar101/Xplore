@@ -6,13 +6,14 @@ import shutil
 from pathlib import Path
 from tempfile import mkdtemp
 
-from fastapi import APIRouter, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 
 from shared import crawler, ingest
 from shared.config import DEFAULT_MAX_FILES, MAX_FILES_CEILING
 from graph.builder import GraphBuilder, IGNORED_DIRS
+from shared.request_control import RequestCancelledError
 from shared.schemas import GithubRequest
-from shared.state import graph_cache, get_parser
+from shared.state import graph_cache
 
 from shared import db
 
@@ -30,12 +31,12 @@ def resolve_local_path(raw: str) -> Path:
     return p
 
 
-def build_graph_for(path: str, max_files: int = 200, codebase_id: str | None = None, user_id: str | None = None) -> dict:
+def build_graph_for(path: str, max_files: int = 0, codebase_id: str | None = None, user_id: str | None = None, request_id: str | None = None) -> dict:
     """Build and return a React Flow graph JSON for the given local path.
     Optionally prefetches explanations (see PREFETCH_EXPLANATIONS). If codebase_id is set, caller persists via db.write_codebase_graph."""
     from shared.config import PREFETCH_EXPLANATIONS
     import shared.ai as ai
-    builder = GraphBuilder(path)
+    builder = GraphBuilder(path, request_id=request_id)
     builder.build_graph(max_files=max_files)
     result = builder.to_json()
     if PREFETCH_EXPLANATIONS:
@@ -49,7 +50,6 @@ def build_graph_for(path: str, max_files: int = 200, codebase_id: str | None = N
 
 def file_tree(root: Path) -> list[dict]:
     """Recursively build a file-explorer tree, filtering ignored dirs."""
-    parser = get_parser()
     items: list[dict] = []
     try:
         entries = sorted(root.iterdir(), key=lambda e: (e.is_file(), e.name.lower()))
@@ -63,7 +63,7 @@ def file_tree(root: Path) -> list[dict]:
             children = file_tree(entry)
             if children:
                 items.append({"name": entry.name, "type": "folder", "path": rel, "children": children})
-        elif parser.is_supported(str(entry)):
+        elif entry.is_file():
             items.append({"name": entry.name, "type": "file", "path": rel})
     return items
 
@@ -75,16 +75,24 @@ router = APIRouter(tags=["graph", "explorer"])
 
 @router.get("/analyze")
 async def analyze_local(
+    request: Request,
     path: str = Query(..., description="Absolute or relative path to the codebase"),
-    max_files: int = Query(200, ge=1, le=MAX_FILES_CEILING, description="Max files to parse"),
+    max_files: int = Query(0, ge=0, le=MAX_FILES_CEILING, description="0 = full scan, >0 = max files to parse"),
     codebase_id: str | None = Query(None, description="If set, persist graph to Postgres under this id"),
     user_id: str | None = Query(None, description="Optional user id (Clerk) to associate analysis"),
 ) -> dict:
     """Analyse a local codebase and return a React Flow dependency graph."""
     resolved = resolve_local_path(path)
-    log.info("Analyzing local path: %s (max_files=%d)", resolved, max_files)
+    max_files_log = "full" if max_files == 0 else str(max_files)
+    log.info("Analyzing local path: %s (max_files=%s)", resolved, max_files_log)
     try:
-        result = build_graph_for(str(resolved), max_files=max_files, codebase_id=codebase_id, user_id=user_id)
+        result = build_graph_for(
+            str(resolved),
+            max_files=max_files,
+            codebase_id=codebase_id,
+            user_id=user_id,
+            request_id=getattr(request.state, "request_id", None),
+        )
         if codebase_id:
             try:
                 if await db.is_available():
@@ -101,32 +109,38 @@ async def analyze_local(
         if codebase_id:
             result["codebase_id"] = codebase_id
         return result
+    except RequestCancelledError as exc:
+        raise HTTPException(status_code=499, detail=str(exc)) from exc
     except Exception as exc:
         log.exception("Error analyzing %s", resolved)
         raise HTTPException(status_code=500, detail=f"Analysis failed: {exc}") from exc
 
 
 @router.post("/analyze/github")
-async def analyze_github(request: GithubRequest) -> dict:
+async def analyze_github(request: GithubRequest, http_request: Request) -> dict:
     """Clone a GitHub repo, analyse it, and return the dependency graph."""
     log.info("Analyzing GitHub repo: %s", request.url)
     try:
         path = ingest.clone_github_repo(request.url)
-        return build_graph_for(path)
+        return build_graph_for(path, request_id=getattr(http_request.state, "request_id", None))
+    except RequestCancelledError as exc:
+        raise HTTPException(status_code=499, detail=str(exc)) from exc
     except Exception as exc:
         log.exception("GitHub analysis failed for %s", request.url)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @router.post("/analyze/upload")
-async def analyze_upload(file: UploadFile = File(...)) -> dict:
+async def analyze_upload(http_request: Request, file: UploadFile = File(...)) -> dict:
     """Upload a .zip archive, extract it, and return the dependency graph."""
     if not file.filename or not file.filename.endswith(".zip"):
         raise HTTPException(status_code=400, detail="Only .zip archives are supported.")
     log.info("Processing upload: %s", file.filename)
     try:
         path = await ingest.process_upload(file)
-        return build_graph_for(path)
+        return build_graph_for(path, request_id=getattr(http_request.state, "request_id", None))
+    except RequestCancelledError as exc:
+        raise HTTPException(status_code=499, detail=str(exc)) from exc
     except Exception as exc:
         log.exception("Upload analysis failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -171,6 +185,25 @@ async def get_graph_from_db(
         raise
     except Exception as exc:
         log.exception("Failed to load graph for %s", codebase_id)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.get("/graph/explanations/status")
+async def explanation_status(
+    codebase_id: str = Query(..., description="Codebase id to check explanation progress"),
+) -> dict:
+    """Lightweight poll: how many nodes have explanations vs total."""
+    try:
+        if not await db.is_available():
+            raise HTTPException(status_code=503, detail="Postgres unavailable.")
+        counts = await db.explanation_progress(codebase_id)
+        if counts is None:
+            raise HTTPException(status_code=404, detail="No graph found")
+        return counts
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log.exception("Explanation status failed for %s", codebase_id)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 

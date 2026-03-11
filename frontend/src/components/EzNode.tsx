@@ -1,6 +1,6 @@
 import React, { memo } from 'react';
 import { NodeProps, Handle, Position } from 'reactflow';
-import { Layers, Terminal } from 'lucide-react';
+import { FileCode, Layers, Terminal } from 'lucide-react';
 
 export const EzNode = memo(function EzNode({ id, data }: NodeProps) {
     const isFocused = Boolean(data.isFocused);
@@ -42,12 +42,14 @@ export const EzNode = memo(function EzNode({ id, data }: NodeProps) {
             )}
 
             <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginBottom: 6 }}>
-                {data.type === 'class'
+                {data.type === 'file'
+                    ? <FileCode size={11} style={{ color: 'var(--t2)', flexShrink: 0 }} />
+                    : data.type === 'class'
                     ? <Layers size={11} style={{ color: 'var(--am)', flexShrink: 0 }} />
                     : <Terminal size={11} style={{ color: 'var(--bl)', flexShrink: 0 }} />}
                 <span style={{
                     fontSize: 8.5, fontWeight: 600, letterSpacing: '.1em', textTransform: 'uppercase',
-                    color: data.type === 'class' ? 'var(--am)' : 'var(--bl)', opacity: .85
+                    color: data.type === 'class' ? 'var(--am)' : data.type === 'file' ? 'var(--t2)' : 'var(--bl)', opacity: .85
                 }}>
                     {data.type}
                 </span>

@@ -27,7 +27,8 @@ async def submit_analyze_job(body: JobAnalyzeRequest) -> dict[str, Any]:
         )
     if not body.path and not body.url:
         raise HTTPException(status_code=400, detail="Provide path or url")
-    max_files = max(1, min(body.max_files, MAX_FILES_CEILING))
+    raw_max_files = int(body.max_files)
+    max_files = 0 if raw_max_files <= 0 else min(raw_max_files, MAX_FILES_CEILING)
     job_id = enqueue(
         "graph_analyze",
         {

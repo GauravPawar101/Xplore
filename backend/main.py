@@ -34,6 +34,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from shared.jobqueue import is_available as queue_available, pop_job
+from shared.request_control import RequestControlMiddleware, cancel_all_requests, set_shutting_down
 from jobs.handlers import run_job
 from routers import ai, graph, meta, narrator_ws, rag, program
 from jobs.router import router as jobs_router
@@ -55,7 +56,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%H:%M:%S",
 )
-log = logging.getLogger("ezdocs")
+log = logging.getLogger("xplore")
 
 _worker_stop = threading.Event()
 
@@ -93,6 +94,7 @@ def _worker_loop() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     log.info("EzDocs API starting up…")
+    set_shutting_down(False)
 
     # Initialise the DB pool NOW — inside the running event loop — so asyncpg
     # never inherits a stale or wrong loop reference.
@@ -109,6 +111,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # ── Shutdown ──
     _worker_stop.set()
+    set_shutting_down(True)
+    cancel_all_requests()
     if worker and worker.is_alive():
         worker.join(timeout=5)
 
@@ -163,6 +167,7 @@ class PreflightCORSMiddleware(BaseHTTPMiddleware):
 
 
 app.add_middleware(PreflightCORSMiddleware)
+app.add_middleware(RequestControlMiddleware)
 
 # ─── Routers ─────────────────────────────────────────────────────────────────
 
@@ -185,7 +190,7 @@ if __name__ == "__main__":
         reload=RELOAD,
         reload_dirs=["."],
         reload_includes=["*.py"],
-        reload_excludes=["ingest/*", "temp/*", "*.tmp", "__pycache__/*"],
+        reload_excludes=["ingested_codebases/**", "temp/**", "__pycache__/**"],
         log_level="info",
         ws_max_size=WS_MAX_SIZE,
     )

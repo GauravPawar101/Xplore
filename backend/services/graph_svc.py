@@ -5,12 +5,15 @@ Run from backend/: uvicorn services.graph_svc:app --port 8001
 """
 
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from shared.config import CORS_ORIGINS
+from shared.request_control import RequestControlMiddleware, cancel_all_requests, set_shutting_down
 from routers import graph, meta
+from jobs.router import router as jobs_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -18,7 +21,16 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
-app = FastAPI(title="EzDocs Graph Service", version="0.2.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    set_shutting_down(False)
+    yield
+    set_shutting_down(True)
+    cancel_all_requests()
+
+
+app = FastAPI(title="EzDocs Graph Service", version="0.2.0", lifespan=lifespan)
+app.add_middleware(RequestControlMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -27,4 +39,5 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(meta.router)
+app.include_router(jobs_router)
 app.include_router(graph.router)

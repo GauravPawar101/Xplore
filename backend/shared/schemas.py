@@ -113,7 +113,7 @@ class JobAnalyzeRequest(BaseModel):
 
     path: Optional[str] = None
     url: Optional[str] = None
-    max_files: int = 200
+    max_files: int = 0
     codebase_id: Optional[str] = None
     user_id: Optional[str] = None
 
