@@ -56,8 +56,10 @@ jobs:
         run: pip install ruff
 
       - name: Lint
-        # E/F/W basics; skip line-length (E501), re-export (F401/F811) and line-continuation (W503)
-        run: ruff check backend/ --select E,F,W --ignore E501,F401,F811,W503
+        # E/F/W basics; skip line-length (E501) and re-export (F401/F811).
+        # W503 is a flake8-only code (line break before binary operator);
+        # ruff does not implement it so it must not appear in --ignore.
+        run: ruff check backend/ --select E,F,W --ignore E501,F401,F811
 
   # ─── Backend tests ─────────────────────────────────────────────────────────
   backend-test:
