@@ -1,3 +1,4 @@
+/// <reference types="vite/client" />
 import React from 'react'
 import ReactDOM from 'react-dom/client'
 import { ClerkProvider } from '@clerk/clerk-react'
@@ -13,6 +14,8 @@ import ConversationPage from '@/pages/ConversationPage'
 import '@/index.css'
 import './CodeMap.css'
 
+// The triple-slash reference above makes `import.meta.env` known to TypeScript.
+// VITE_ prefixed vars are injected at build time by Vite.
 const PUBLISHABLE_KEY = import.meta.env.VITE_CLERK_PUBLISHABLE_KEY
 if (!PUBLISHABLE_KEY) {
   throw new Error('Missing Clerk Publishable Key. Set VITE_CLERK_PUBLISHABLE_KEY in .env.local')
@@ -36,7 +39,7 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
             }
           >
             <Route index element={<EzDocsIDE />} />
-            <Route path="graphs" element={<MyGraphsPage />} />
+            <Route path="graphs"       element={<MyGraphsPage />} />
             <Route path="conversation" element={<ConversationPage />} />
           </Route>
           <Route path="*" element={<Navigate to="/" replace />} />

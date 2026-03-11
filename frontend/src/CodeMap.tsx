@@ -19,7 +19,6 @@ import ReactFlow, {
 } from 'reactflow';
 import 'reactflow/dist/base.css';
 import { PromptBar } from '@/components/Promptbar';
-import { ZoomBar } from '@/components/Zoombar';
 import { VoiceSelector } from '@/components/VoiceSelector';
 import {
   Play,
@@ -445,7 +444,9 @@ function EzDocsInner() {
     });
   }, []);
 
-  const expandNextLayer = useCallback(() => {
+  // expandNextLayer, expandAll, collapseToRoot are available for future toolbar use
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const _expandNextLayer = useCallback(() => {
     setVisibleNodeIds(prev => {
       const next = new Set(prev);
       let maxVisibleLayer = -1;
@@ -474,7 +475,8 @@ function EzDocsInner() {
     });
   }, []);
 
-  const expandAll = useCallback(() => {
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const _expandAll = useCallback(() => {
     setVisibleNodeIds(() => {
       const next = new Set<string>();
       for (const n of rawRef.current.nodes) next.add(n.id);
@@ -482,7 +484,8 @@ function EzDocsInner() {
     });
   }, []);
 
-  const collapseToRoot = useCallback(() => {
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const _collapseToRoot = useCallback(() => {
     if (rawRef.current.nodes.length === 0) return;
     const rn = rawRef.current.nodes;
     const re = rawRef.current.edges;

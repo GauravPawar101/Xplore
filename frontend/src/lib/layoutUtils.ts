@@ -1,8 +1,6 @@
 import { Node, Edge } from 'reactflow';
 import { RN, RE } from '@/types';
 import {
-    LEVEL_W,
-    LINE_SCALE,
     NODE_W,
     NODE_H,
     NODE_GAP,
@@ -84,8 +82,6 @@ export function treeLayout(
         }
     }
 
-    // Prefer nodes from root-level files (is_root_file flag) as the entry node;
-    // fall back to keyword-based detection for repos where all code is in subdirectories.
     const entry =
         rawNodes.find((n) => Boolean(n.data.is_root_file)) ??
         rawNodes.find((n) => {
@@ -101,7 +97,6 @@ export function treeLayout(
 
     const entryFile = nodeToFile.get(entry.id) ?? 'unknown';
 
-    // Seed BFS from all root-level files so they all get depth 0.
     const rootFileSet = new Set(
         rawNodes
             .filter((n) => Boolean(n.data.is_root_file))
@@ -122,9 +117,6 @@ export function treeLayout(
         }
     }
     const maxD = Math.max(0, ...fileDepth.values());
-    // For files not reached by BFS, use backend layer as depth hint;
-    // fall back to filesystem depth (path segment count) so root-dir files
-    // still appear earlier than deeply nested ones.
     for (const [fp, nodes] of fileGroups) {
         if (!fileDepth.has(fp)) {
             const backendLayer = Number(nodes[0]?.data?.layer ?? -1);
@@ -160,8 +152,6 @@ export function treeLayout(
         depthCols.get(d)!.push(fp);
     }
 
-    // Sort files within each depth column: fewer path separators (closer to root dir) first,
-    // then alphabetically for stable ordering.
     for (const [, files] of depthCols) {
         files.sort((a, b) => {
             const depthA = (a.match(/[/\\]/g) || []).length;
@@ -171,8 +161,8 @@ export function treeLayout(
         });
     }
 
-    const CLUSTER_GAP_X = 450;
-    const CLUSTER_GAP_Y = 180;
+    const CLUSTER_GAP_X  = 450;
+    const CLUSTER_GAP_Y  = 180;
     const CLUSTER_PADDING = 50;
 
     const clusterBounds = new Map<string, { x: number; y: number; width: number; height: number }>();
@@ -181,11 +171,11 @@ export function treeLayout(
         for (const fp of files) {
             const nodes = fileGroups.get(fp) ?? [];
             const clusterHeight = nodes.length * (NODE_H + NODE_GAP) + CLUSTER_PADDING * 2;
-            const clusterWidth = NODE_W + CLUSTER_PADDING * 2;
+            const clusterWidth  = NODE_W + CLUSTER_PADDING * 2;
             clusterBounds.set(fp, {
                 x: 60 + depth * CLUSTER_GAP_X,
                 y: yOffset,
-                width: clusterWidth,
+                width:  clusterWidth,
                 height: clusterHeight,
             });
             yOffset += clusterHeight + CLUSTER_GAP_Y;
@@ -210,29 +200,29 @@ export function treeLayout(
     }
 
     const rfNodes: Node[] = rawNodes.map((n) => {
-        const fp = nodeToFile.get(n.id) ?? 'unknown';
+        const fp    = nodeToFile.get(n.id) ?? 'unknown';
         const depth = nodeDepth.get(n.id) ?? maxNodeD + 1;
         return {
-            id: n.id,
+            id:   n.id,
             type: 'ez',
             position: pos.get(n.id) ?? { x: 0, y: 0 },
             data: {
                 ...n.data,
-                isEntry: n.id === entry.id,
-                cluster: fp,
+                isEntry:      n.id === entry.id,
+                cluster:      fp,
                 clusterColor: getClusterColor(fp, fileDepth.get(fp) ?? maxD + 1),
                 depth,
-                fileDepth: fileDepth.get(fp) ?? maxD + 1,
+                fileDepth:    fileDepth.get(fp) ?? maxD + 1,
                 isFocused: false,
-                isCalled: false,
-                isCaller: false,
-                isDim: false,
+                isCalled:  false,
+                isCaller:  false,
+                isDim:     false,
             },
-            width: NODE_W,
-            height: NODE_H,
+            width:     NODE_W,
+            height:    NODE_H,
             draggable: true,
             selectable: false,
-            focusable: false,
+            focusable:  false,
         };
     });
 
@@ -240,18 +230,18 @@ export function treeLayout(
         const sf = nodeToFile.get(e.source);
         const tf = nodeToFile.get(e.target);
         return {
-            id: e.id,
+            id:     e.id,
             source: e.source,
             target: e.target,
-            type: 'ez',
+            type:   'ez',
             data: {
-                line: callLine.get(e.target) ?? 0,
-                inTree: fileDepth.has(sf ?? '') && fileDepth.has(tf ?? ''),
-                isCrossCluster: sf !== tf,
-                sourceCluster: sf,
-                targetCluster: tf,
+                line:            callLine.get(e.target) ?? 0,
+                inTree:          fileDepth.has(sf ?? '') && fileDepth.has(tf ?? ''),
+                isCrossCluster:  sf !== tf,
+                sourceCluster:   sf,
+                targetCluster:   tf,
             },
-            animated: false,
+            animated:  false,
             focusable: false,
         };
     });
@@ -263,7 +253,7 @@ export function treeLayout(
             filepath,
             bounds,
             depth,
-            color: getClusterColor(filepath, depth),
+            color:   getClusterColor(filepath, depth),
             isEntry: rootFileSet.size > 0 ? rootFileSet.has(filepath) : filepath === entryFile,
             nodeCount: fileGroups.get(filepath)?.length ?? 0,
         };
@@ -302,15 +292,11 @@ export function architectLayout(
 
     const filePaths = [...groups.keys()];
 
-    // Root-level files: use is_root_file from node data when available, otherwise
-    // detect by the absence of a directory separator in the relative path.
-    // The path-separator fallback handles cached graphs that pre-date the is_root_file field.
     const rootFilePaths = filePaths.filter((fp) =>
         groups.get(fp)?.some((n) => Boolean(n.data.is_root_file))
             ?? (!fp.includes('/') && !fp.includes('\\'))
     );
 
-    // Seed files for BFS at depth 0: all root files, or fall back to keyword-matched entry
     const seedFiles =
         rootFilePaths.length > 0
             ? rootFilePaths
@@ -322,8 +308,8 @@ export function architectLayout(
     const entryFile = seedFiles[0] ?? filePaths[0];
 
     const fileDepth = new Map<string, number>(seedFiles.map((fp) => [fp, 0]));
-    const bfsQ = seedFiles.length > 0 ? [...seedFiles] : [entryFile];
-    const bfsSeen = new Set(bfsQ);
+    const bfsQ      = seedFiles.length > 0 ? [...seedFiles] : [entryFile];
+    const bfsSeen   = new Set(bfsQ);
     while (bfsQ.length) {
         const cur = bfsQ.shift()!;
         for (const next of fileAdj.get(cur) ?? new Set()) {
@@ -358,45 +344,45 @@ export function architectLayout(
     for (const [fp, members] of groups) {
         const p = filePos.get(fp)!;
         const normalizedFp = fp.replace(/\\/g, '/');
-        const basename = normalizedFp.split('/').pop() ?? normalizedFp;
-        const depth = fileDepth.get(fp) ?? maxD + 1;
+        const basename     = normalizedFp.split('/').pop() ?? normalizedFp;
+        const depth        = fileDepth.get(fp) ?? maxD + 1;
         const { label: langLabel, color: langColor } = langInfo(basename);
         const isRootFile = members.some((n) => Boolean(n.data.is_root_file));
         const isRootDep  = !isRootFile && members.some((n) => Boolean(n.data.is_root_dep));
         rfNodes.push({
-            id: `file::${fp}`,
+            id:   `file::${fp}`,
             type: 'fileGroup',
             position: { x: p.x, y: p.y },
             data: {
                 filepath: fp,
-                label: normalizedFp,
+                label:    normalizedFp,
                 langLabel,
                 langColor,
-                isEntry: seedFiles.includes(fp),
+                isEntry:     seedFiles.includes(fp),
                 is_root_file: isRootFile,
-                is_root_dep: isRootDep,
+                is_root_dep:  isRootDep,
                 depth,
                 isFocused: false,
-                isCalled: false,
-                isCaller: false,
-                isDim: false,
+                isCalled:  false,
+                isCaller:  false,
+                isDim:     false,
                 members: members.map((n) => ({
-                    id: n.id,
-                    name: n.data.label as string,
-                    type: n.data.type as string,
-                    code: n.data.code as string,
+                    id:         n.id,
+                    name:       n.data.label as string,
+                    type:       n.data.type as string,
+                    code:       n.data.code as string,
                     start_line: n.data.start_line as number,
-                    end_line: n.data.end_line as number,
-                    filepath: fp,
-                    hasHidden: Boolean((n.data as any)?.hasHidden),
+                    end_line:   n.data.end_line as number,
+                    filepath:   fp,
+                    hasHidden:  Boolean((n.data as any)?.hasHidden),
                 })),
                 hasAnyHidden: members.some((n) => (n.data as any)?.hasHidden),
             },
-            width: FILE_NODE_W,
-            height: p.h,
+            width:     FILE_NODE_W,
+            height:    p.h,
             draggable: true,
             selectable: false,
-            focusable: false,
+            focusable:  false,
         });
     }
 
@@ -408,12 +394,12 @@ export function architectLayout(
             if (!edgeSeen.has(eid)) {
                 edgeSeen.add(eid);
                 rfEdges.push({
-                    id: eid,
+                    id:     eid,
                     source: `file::${sf}`,
                     target: `file::${tf}`,
-                    type: 'ez',
-                    data: { inTree: true, line: 0 },
-                    animated: false,
+                    type:   'ez',
+                    data:   { inTree: true, line: 0 },
+                    animated:  false,
                     focusable: false,
                 });
             }
@@ -428,14 +414,14 @@ export function applyEdgeFocus(edges: Edge[], focusId: string | null): Edge[] {
     if (!focusId) {
         return edges.map((e) => {
             const isCrossCluster = (e.data as any)?.isCrossCluster;
-            const expandPulse = (e.data as any)?._expandPulse;
+            const expandPulse    = (e.data as any)?._expandPulse;
             return {
                 ...e,
                 data: {
                     ...e.data,
-                    _active: false,
-                    _animated: false,
-                    _expandPulse: expandPulse,
+                    _active:       false,
+                    _animated:     false,
+                    _expandPulse:  expandPulse,
                     _color: isCrossCluster
                         ? 'rgba(139,92,246,0.55)'
                         : (e.data as any)?.inTree ? 'var(--c4)' : 'var(--c3)',
@@ -448,18 +434,18 @@ export function applyEdgeFocus(edges: Edge[], focusId: string | null): Edge[] {
     }
 
     return edges.map((e) => {
-        const isOut = e.source === focusId;
-        const isIn = e.target === focusId;
-        const active = isOut || isIn;
+        const isOut          = e.source === focusId;
+        const isIn           = e.target === focusId;
+        const active         = isOut || isIn;
         const isCrossCluster = (e.data as any)?.isCrossCluster;
-        const expandPulse = (e.data as any)?._expandPulse;
+        const expandPulse    = (e.data as any)?._expandPulse;
 
         return {
             ...e,
             data: {
                 ...e.data,
-                _active: active,
-                _animated: active,
+                _active:      active,
+                _animated:    active,
                 _expandPulse: expandPulse,
                 _color: active
                     ? isOut ? 'var(--bl)' : 'var(--tl)'

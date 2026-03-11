@@ -1,4 +1,4 @@
-import React, { memo } from 'react';
+import { memo } from 'react';
 import { EdgeProps } from 'reactflow';
 
 export const EzEdge = memo(function EzEdge({
@@ -10,9 +10,9 @@ export const EzEdge = memo(function EzEdge({
     const pathD = `M ${sourceX},${sourceY} C ${midX},${sourceY} ${midX},${targetY} ${targetX},${targetY}`;
 
     const color = (data as any)?._color as string ?? (inTree ? 'var(--c4)' : 'var(--c3)');
-    const sw = (data as any)?._sw as number ?? 1;
-    const so = (data as any)?._so as number ?? (inTree ? 0.5 : 0.18);
-    const isActive = (data as any)?._active as boolean;
+    const sw    = (data as any)?._sw as number ?? 1;
+    const so    = (data as any)?._so as number ?? (inTree ? 0.5 : 0.18);
+    const isActive    = (data as any)?._active as boolean;
     const expandPulse = (data as any)?._expandPulse as boolean;
 
     const labelX = midX + 6;
@@ -33,7 +33,8 @@ export const EzEdge = memo(function EzEdge({
             )}
             {expandPulse && (
                 <path className="ez-edge-pulse" d={pathD} fill="none" stroke="#a78bfa" strokeWidth={3} strokeOpacity={0.95}
-                    strokeLinecap="round" pathLength={1} strokeDasharray="0.07 1" style={{ animation: 'ez-edge-pulse-draw 1.2s ease-out forwards' }} />
+                    strokeLinecap="round" pathLength={1} strokeDasharray="0.07 1"
+                    style={{ animation: 'ez-edge-pulse-draw 1.2s ease-out forwards' }} />
             )}
             <path
                 d={`M ${targetX - 6},${targetY - 5} L ${targetX},${targetY} L ${targetX - 6},${targetY + 5}`}

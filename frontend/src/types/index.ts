@@ -1,4 +1,4 @@
-import { Node, Edge } from 'reactflow';
+// Core graph primitive types used across layoutUtils, CodeMap, and API responses.
 
 export interface RN {
     id: string;
